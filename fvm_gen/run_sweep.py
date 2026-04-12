@@ -7,11 +7,12 @@ SweepConfig, saving each run into its own subdirectory.
 Usage
 -----
     cd /path/to/flsim/fvm_solver
-    python ../fvm_gen/run_sweep.py
+    python ../fvm_gen/run_sweep.py sweep.json
 
-You can also import and call `run_sweep(cfg)` directly.
+You can also import and call `run_sweep(cfg)` or `run_sweep_from_file(path)` directly.
 """
 
+import json
 import os
 import sys
 import pickle
@@ -88,6 +89,13 @@ def _init_conds(cfg, mesh, edge_tag, bound_edgs, phy_setup):
 # Core sweep runner
 # ---------------------------------------------------------------------------
 
+def sweep_cfg_from_file(path: str) -> SweepConfig:
+    """Load a SweepConfig from a JSON file."""
+    with open(path) as f:
+        data = json.load(f)
+    return SweepConfig(**data)
+
+
 def run_sweep(sweep_cfg: SweepConfig | None = None):
     if sweep_cfg is None:
         sweep_cfg = SweepConfig()
@@ -156,4 +164,7 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_sweep()
+    if len(sys.argv) > 1:
+        run_sweep(sweep_cfg_from_file(sys.argv[1]))
+    else:
+        run_sweep()
