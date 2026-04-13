@@ -104,6 +104,15 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
 
     base_cfg = _make_cfg(sweep_cfg.problem)
 
+    # Allow the compute device to be overridden via environment variable.
+    # e.g.  FVM_DEVICE=cuda python run_sweep.py sweep.json
+    device = os.environ.get("FVM_DEVICE")
+    if device is not None:
+        base_cfg = apply_overrides(base_cfg, {"device": device})
+        c_print(f"Device (FVM_DEVICE): {device}", "cyan")
+    else:
+        c_print(f"Device (FVM_DEVICE not set): {base_cfg.device}", "cyan")
+
     # Output root
     out_root = os.path.join(ARTEFACT_DIR, sweep_cfg.output_subdir)
     os.makedirs(out_root, exist_ok=True)
