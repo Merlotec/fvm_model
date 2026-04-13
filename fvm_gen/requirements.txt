@@ -1,0 +1,7 @@
+# fvm_gen dependencies
+# Also requires fvm_solver (../../fvm_solver) to be on sys.path — see run_sweep.py.
+# The fvm_solver/requirements.txt covers the solver-side packages.
+
+git+https://github.com/Maccy-Z/c_print.git
+numpy
+torch
