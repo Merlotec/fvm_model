@@ -6,8 +6,7 @@ SweepConfig, saving each run into its own subdirectory.
 
 Usage
 -----
-    cd /path/to/flsim/fvm_solver
-    python ../fvm_gen/run_sweep.py sweep.json
+    python fvm_model/fvm_gen/run_sweep.py fvm_model/fvm_gen/sweep.json
 
 You can also import and call `run_sweep(cfg)` or `run_sweep_from_file(path)` directly.
 """
@@ -29,7 +28,7 @@ from cprint import c_print
 # The modules inside time_fvm/ use bare imports (e.g. `from sparse_utils import
 # ...`) so both fvm_solver/ and fvm_solver/time_fvm/ must be on sys.path.
 # ---------------------------------------------------------------------------
-_SOLVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "fvm_solver"))
+_SOLVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "fvm_solver"))
 _TIME_FVM_DIR = os.path.join(_SOLVER_DIR, "time_fvm")
 for _p in (_SOLVER_DIR, _TIME_FVM_DIR):
     if _p not in sys.path:

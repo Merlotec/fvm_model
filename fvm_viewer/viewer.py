@@ -1,29 +1,44 @@
 """
-FVM solution viewer.
+FVM solution browser-based viewer.
 
-Usage:
-    # Point at a single run directory:
+Runs a local web server — open the printed URL in your browser.
+No display / GUI required; works over SSH port-forwarding from HPC nodes.
+
+Usage
+-----
+    # Single run directory:
     python viewer.py path/to/mu_b_1.0000e-3/
 
-    # Point at a dataset directory (contains multiple run subdirectories):
+    # Dataset directory (contains multiple run sub-dirs):
     python viewer.py path/to/fvm_gen_datasets/
 
-Navigation:
-    Left / Right arrow keys  — previous / next timestep within current run
-    Up   / Down  arrow keys  — switch to run above / below at the nearest t
-    Click a run name in the left panel to jump to it
-    Prev / Next buttons      — same as Left / Right
+    # Custom port:
+    python viewer.py path/to/data/ --port 8050
+
+HPC port-forwarding
+-------------------
+    On the HPC node:
+        python viewer.py /path/to/data --port 8050
+
+    On your local machine:
+        ssh -L 8050:localhost:8050 user@hpc-node
+
+    Then open http://localhost:8050 in your local browser.
+
+Navigation
+----------
+    Click a run name on the left panel to switch runs.
+    Use Prev / Next buttons or the slider to move between timesteps.
+    Plotly figures support scroll-to-zoom and drag-to-pan.
 """
 
 import os
 import argparse
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
-from matplotlib.widgets import Button
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-
+import plotly.graph_objects as go
+import dash
+from dash import dcc, html, Input, Output, State, callback_context
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 
@@ -75,197 +90,276 @@ def load_step(path: str) -> tuple[float, np.ndarray]:
 
 
 def closest_idx(files: list[str], target_t: float) -> int:
-    """Index of the file whose t is closest to target_t."""
     return min(range(len(files)), key=lambda i: abs(t_of_file(files[i]) - target_t))
 
 
 # ---------------------------------------------------------------------------
-# Viewer
+# Plot construction
 # ---------------------------------------------------------------------------
 
-class Viewer:
-    def __init__(self, root_dir: str):
-        self.run_dirs = find_run_dirs(os.path.abspath(root_dir))
-        self.run_idx  = 0
-        self.step_idx = 0
-        self._load_run()
-        self._build_figure()
-        self._render()
+_CAMERA = dict(
+    eye=dict(x=0, y=0, z=1),
+    up=dict(x=0, y=1, z=0),
+    center=dict(x=0, y=0, z=0),
+    projection=dict(type="orthographic"),
+)
 
-    # ---- run / timestep loading --------------------------------------------
+_SCENE = dict(
+    camera=_CAMERA,
+    dragmode="pan",      # drag = translate; scroll = zoom; rotation disabled
+    aspectmode="data",
+    bgcolor="white",
+    xaxis=dict(visible=False, showgrid=False, zeroline=False),
+    yaxis=dict(visible=False, showgrid=False, zeroline=False),
+    zaxis=dict(visible=False, showgrid=False, zeroline=False, range=[-0.01, 0.01]),
+)
 
-    def _load_run(self):
-        run_dir = self.run_dirs[self.run_idx]
-        mesh = load_mesh(run_dir)
+_LIGHTING = dict(ambient=1.0, diffuse=0.0, specular=0.0, roughness=1.0, fresnel=0.0)
+
+
+def make_field_figure(verts: np.ndarray, tris: np.ndarray, values: np.ndarray, title: str) -> go.Figure:
+    """
+    2D coloured triangular-mesh figure rendered as a top-down Mesh3d.
+    Per-face (cell-centred) colouring via intensitymode='cell'.
+    """
+    fig = go.Figure(go.Mesh3d(
+        x=verts[:, 0],
+        y=verts[:, 1],
+        z=np.zeros(len(verts), dtype=np.float32),
+        i=tris[:, 0].astype(int),
+        j=tris[:, 1].astype(int),
+        k=tris[:, 2].astype(int),
+        intensity=values,
+        intensitymode="cell",
+        colorscale="Viridis",
+        showscale=True,
+        flatshading=True,
+        lighting=_LIGHTING,
+        colorbar=dict(thickness=12, len=0.85),
+    ))
+    # uirevision must be a constant per field so Plotly never resets the
+    # camera regardless of which timestep or run is shown.  Setting it on
+    # both layout and layout.scene is required for 3D scenes.
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=13), x=0.5, xanchor="center"),
+        scene=dict(**_SCENE, uirevision=title),
+        margin=dict(l=0, r=0, t=36, b=0),
+        height=320,
+        uirevision=title,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Dash app
+# ---------------------------------------------------------------------------
+
+def build_app(root_dir: str) -> dash.Dash:
+    run_dirs = find_run_dirs(os.path.abspath(root_dir))
+
+    # Pre-load mesh and file lists for all runs
+    meshes: dict[str, dict]        = {d: load_mesh(d)            for d in run_dirs}
+    all_files: dict[str, list[str]] = {d: find_timestep_files(d) for d in run_dirs}
+
+    app = dash.Dash(__name__, title="FVM Viewer")
+
+    # ---- Layout ----
+
+    run_options = [
+        {"label": os.path.basename(d), "value": i}
+        for i, d in enumerate(run_dirs)
+    ]
+
+    sidebar = html.Div([
+        html.H4("Runs", style={"margin": "0 0 10px 0", "fontSize": "13px", "fontWeight": "600"}),
+        dcc.RadioItems(
+            id="run-selector",
+            options=run_options,
+            value=0,
+            labelStyle={
+                "display": "block",
+                "fontSize": "11px",
+                "padding": "3px 0",
+                "cursor": "pointer",
+                "wordBreak": "break-all",
+            },
+        ),
+    ], style={
+        "width": "190px",
+        "flexShrink": "0",
+        "padding": "12px 10px",
+        "borderRight": "1px solid #ddd",
+        "overflowY": "auto",
+        "fontFamily": "monospace",
+    })
+
+    plot_grid = dcc.Loading(
+        type="circle",
+        color="#4a90d9",
+        children=html.Div(
+            [dcc.Graph(id=f"plot-{i}", config={
+                "scrollZoom": True,
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": ["orbitRotation", "tableRotation", "resetCameraLastSave3d", "resetCameraDefault3d"],
+                "displaylogo": False,
+            }) for i in range(4)],
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "1fr 1fr",
+                "gap": "4px",
+                "padding": "4px",
+            },
+        ),
+    )
+
+    nav_bar = html.Div([
+        html.Button("◀  Prev", id="btn-prev", n_clicks=0,
+                    style={"fontSize": "13px", "padding": "5px 16px", "cursor": "pointer"}),
+        html.Button("Next  ▶", id="btn-next", n_clicks=0,
+                    style={"fontSize": "13px", "padding": "5px 16px", "marginLeft": "10px", "cursor": "pointer"}),
+        html.Div(
+            dcc.Slider(
+                id="step-slider",
+                min=0, max=0, step=1, value=0,
+                marks=None,
+                tooltip={"placement": "bottom", "always_visible": True},
+            ),
+            style={"flex": "1", "margin": "0 20px"},
+        ),
+    ], style={"display": "flex", "alignItems": "center", "padding": "8px 12px", "borderTop": "1px solid #ddd"})
+
+    header = html.Div([
+        html.Span("FVM Viewer", style={"fontWeight": "600", "fontSize": "16px", "marginRight": "20px"}),
+        html.Span(id="header-info", style={"fontSize": "12px", "color": "#555", "fontFamily": "monospace"}),
+    ], style={"padding": "8px 12px", "borderBottom": "1px solid #ddd", "display": "flex", "alignItems": "baseline"})
+
+    app.layout = html.Div([
+        header,
+        html.Div([
+            sidebar,
+            html.Div([plot_grid, nav_bar], style={"flex": "1", "overflow": "auto", "display": "flex", "flexDirection": "column"}),
+        ], style={"display": "flex", "flex": "1", "overflow": "hidden"}),
+        dcc.Store(id="state", data={"run_idx": 0, "step_idx": 0}),
+        dcc.Store(id="_key-init", data=False),
+        dcc.Interval(id="_key-interval", interval=300, max_intervals=1),
+    ], style={"display": "flex", "flexDirection": "column", "height": "100vh", "fontFamily": "sans-serif"})
+
+    # ---- Keyboard navigation (clientside) ----
+    # Fires once after 300 ms to attach a keydown listener that clicks the
+    # Prev/Next buttons, giving Left/Right arrow key navigation in the browser.
+
+    app.clientside_callback(
+        """
+        function(_n) {
+            document.addEventListener('keydown', function(e) {
+                var tag = document.activeElement ? document.activeElement.tagName : '';
+                var editable = document.activeElement && document.activeElement.isContentEditable;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || editable) return;
+                if (e.key === 'ArrowLeft')  document.getElementById('btn-prev').click();
+                if (e.key === 'ArrowRight') document.getElementById('btn-next').click();
+            });
+            return true;
+        }
+        """,
+        Output("_key-init", "data"),
+        Input("_key-interval", "n_intervals"),
+        prevent_initial_call=True,
+    )
+
+    # ---- Callbacks ----
+
+    @app.callback(
+        Output("state", "data"),
+        Input("btn-prev", "n_clicks"),
+        Input("btn-next", "n_clicks"),
+        Input("run-selector", "value"),
+        Input("step-slider", "value"),
+        State("state", "data"),
+        prevent_initial_call=True,
+    )
+    def update_state(_n_prev, _n_next, run_sel, slider_val, state):
+        triggered = callback_context.triggered_id
+        state = dict(state)
+
+        if triggered == "run-selector" and run_sel is not None:
+            old_run = run_dirs[state["run_idx"]]
+            old_t = t_of_file(all_files[old_run][state["step_idx"]]) if all_files[old_run] else 0.0
+            state["run_idx"] = run_sel
+            new_run = run_dirs[run_sel]
+            state["step_idx"] = closest_idx(all_files[new_run], old_t)
+
+        elif triggered == "btn-prev":
+            run = run_dirs[state["run_idx"]]
+            state["step_idx"] = (state["step_idx"] - 1) % len(all_files[run])
+
+        elif triggered == "btn-next":
+            run = run_dirs[state["run_idx"]]
+            state["step_idx"] = (state["step_idx"] + 1) % len(all_files[run])
+
+        elif triggered == "step-slider" and slider_val is not None:
+            state["step_idx"] = int(slider_val)
+
+        return state
+
+    @app.callback(
+        Output("plot-0", "figure"),
+        Output("plot-1", "figure"),
+        Output("plot-2", "figure"),
+        Output("plot-3", "figure"),
+        Output("header-info", "children"),
+        Output("step-slider", "max"),
+        Output("step-slider", "value"),
+        Input("state", "data"),
+    )
+    def render(state):
+        run_idx  = state["run_idx"]
+        step_idx = state["step_idx"]
+        run_dir  = run_dirs[run_idx]
+        files    = all_files[run_dir]
+        mesh     = meshes[run_dir]
+
         verts = mesh["vertices"]
         tris  = mesh["triangles"]
-        self.triang = mtri.Triangulation(verts[:, 0], verts[:, 1], tris)
-        self.files  = find_timestep_files(run_dir)
-        if not self.files:
-            raise RuntimeError(f"No t_*.npz files in {run_dir}")
 
-    def _switch_run(self, new_idx: int, target_t: float | None = None):
-        if new_idx < 0 or new_idx >= len(self.run_dirs):
-            return
-        if target_t is None:
-            target_t = t_of_file(self.files[self.step_idx])
-        self.run_idx = new_idx
-        self._load_run()
-        self.step_idx = closest_idx(self.files, target_t)
-        self._rebuild_plots()
-        self._refresh_run_list()
-        self._render()
+        t, cell_prims = load_step(files[step_idx])
+        n = len(files)
 
-    # ---- figure construction -----------------------------------------------
+        run_name = os.path.basename(run_dir)
+        header   = f"{run_name}   |   step {step_idx + 1}/{n}   |   t = {t:.4g}"
 
-    def _build_figure(self):
-        self.fig = plt.figure(figsize=(17, 9))
+        figs = [make_field_figure(verts, tris, cell_prims[:, i], FIELD_NAMES[i]) for i in range(4)]
+        return (*figs, header, n - 1, step_idx)
 
-        # columns: [run list | field plot 1 | field plot 2]
-        # rows:    [top plots | bottom plots | buttons]
-        gs = self.fig.add_gridspec(
-            3, 3,
-            width_ratios=[1, 2.2, 2.2],
-            height_ratios=[1, 1, 0.1],
-            hspace=0.45, wspace=0.4,
-            left=0.04, right=0.97, top=0.93, bottom=0.04,
-        )
-
-        # -- run list panel (spans both plot rows) --
-        self.ax_runs = self.fig.add_subplot(gs[:2, 0])
-        self.ax_runs.set_navigate(False)
-
-        # -- 4 field subplots --
-        self.axes = [
-            self.fig.add_subplot(gs[0, 1]),
-            self.fig.add_subplot(gs[0, 2]),
-            self.fig.add_subplot(gs[1, 1]),
-            self.fig.add_subplot(gs[1, 2]),
-        ]
-        self.tricolors: list = [None] * 4
-        self.colorbars: list = [None] * 4
-
-        self._build_plots()
-
-        # -- Prev / Next buttons --
-        ax_prev = self.fig.add_subplot(gs[2, 1])
-        ax_next = self.fig.add_subplot(gs[2, 2])
-        self.btn_prev = Button(ax_prev, "◀  Prev")
-        self.btn_next = Button(ax_next, "Next  ▶")
-        self.btn_prev.on_clicked(lambda _: self._step(-1))
-        self.btn_next.on_clicked(lambda _: self._step(+1))
-
-        # -- draw run list --
-        self._draw_run_list()
-
-        self.fig.canvas.mpl_connect("key_press_event",    self._on_key)
-        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-
-    def _build_plots(self):
-        """Create tripcolor artists for the current triangulation."""
-        dummy = np.zeros(len(self.triang.triangles))
-        for i, ax in enumerate(self.axes):
-            ax.cla()
-            tc = ax.tripcolor(self.triang, facecolors=dummy, cmap="viridis", shading="flat")
-            self.tricolors[i] = tc
-            ax.set_aspect("equal", adjustable="box")
-            ax.set_title(FIELD_NAMES[i], fontsize=9)
-            divider = make_axes_locatable(ax)
-            cax = divider.append_axes("right", size="4%", pad=0.06)
-            if self.colorbars[i] is not None:
-                self.colorbars[i].ax.remove()
-            self.colorbars[i] = self.fig.colorbar(tc, cax=cax)
-
-    def _rebuild_plots(self):
-        """Called when switching to a run with a potentially different mesh."""
-        self._build_plots()
-
-    # ---- run list ----------------------------------------------------------
-
-    def _draw_run_list(self):
-        ax = self.ax_runs
-        ax.cla()
-        ax.axis("off")
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.set_title("Runs", fontsize=9, pad=3)
-
-        n = len(self.run_dirs)
-        self._run_list_n = n
-        for i, run_dir in enumerate(self.run_dirs):
-            name = os.path.basename(run_dir)
-            y = 1.0 - (i + 0.5) / n
-            selected = (i == self.run_idx)
-            ax.text(
-                0.05, y, name,
-                transform=ax.transAxes,
-                fontsize=7.5,
-                color="royalblue" if selected else "black",
-                fontweight="bold" if selected else "normal",
-                va="center", ha="left",
-                clip_on=True,
-            )
-
-    def _refresh_run_list(self):
-        self._draw_run_list()
-
-    # ---- rendering ---------------------------------------------------------
-
-    def _render(self):
-        t, cell_prims = load_step(self.files[self.step_idx])
-        n = len(self.files)
-        run_name = os.path.basename(self.run_dirs[self.run_idx])
-        self.fig.suptitle(
-            f"{run_name}   |   step {self.step_idx + 1}/{n}   |   t = {t:.4g}",
-            fontsize=10,
-        )
-        for i in range(4):
-            values = cell_prims[:, i]
-            self.tricolors[i].set_array(values)
-            self.tricolors[i].set_clim(values.min(), values.max())
-            self.colorbars[i].update_normal(self.tricolors[i])
-        self.fig.canvas.draw_idle()
-
-    # ---- navigation --------------------------------------------------------
-
-    def _step(self, delta: int):
-        self.step_idx = (self.step_idx + delta) % len(self.files)
-        self._render()
-
-    def _on_key(self, event):
-        if event.key == "right":
-            self._step(+1)
-        elif event.key == "left":
-            self._step(-1)
-        elif event.key == "up":
-            self._switch_run(self.run_idx - 1)
-        elif event.key == "down":
-            self._switch_run(self.run_idx + 1)
-
-    def _on_click(self, event):
-        if event.inaxes is not self.ax_runs:
-            return
-        # Map y position in axes coords → run index
-        x_ax, y_ax = self.ax_runs.transAxes.inverted().transform((event.x, event.y))
-        idx = int((1.0 - y_ax) * self._run_list_n)
-        idx = max(0, min(idx, self._run_list_n - 1))
-        if idx != self.run_idx:
-            self._switch_run(idx)
-
-    def show(self):
-        plt.show()
+    return app
 
 
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="View FVM solution timesteps.")
+    parser = argparse.ArgumentParser(
+        description="View FVM solution timesteps in a browser.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "directory",
-        help="Run directory (contains mesh_props.npz) or dataset directory (contains run subdirs)",
+        help="Run directory (contains mesh_props.npz) or dataset directory (contains run sub-dirs)",
+    )
+    parser.add_argument("--port", type=int, default=8050, help="Port to listen on (default: 8050)")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Bind address. Use 127.0.0.1 (default) for SSH port-forwarding, "
+             "or 0.0.0.0 to allow direct network access.",
     )
     args = parser.parse_args()
-    Viewer(args.directory).show()
+
+    app = build_app(args.directory)
+
+    print(f"\n  FVM Viewer running at  http://{args.host}:{args.port}/")
+    if args.host == "127.0.0.1":
+        print(f"  For HPC port-forwarding: ssh -L {args.port}:localhost:{args.port} user@hpc-node")
+    print()
+
+    app.run(host=args.host, port=args.port, debug=False)
 
 
 if __name__ == "__main__":
