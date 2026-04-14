@@ -11,10 +11,10 @@ set -euo pipefail
 
 # ---- configuration ----
 REMOTE="csd3"
-SLURM_SCRIPT="~/rds/hpc-work/flsim/fvm_model/fvm_viewer/viewer.slurm"
+SLURM_SCRIPT='/home/nk624/rds/hpc-work/flsim/fvm_model/fvm_viewer/viewer.slurm'
 # -----------------------
 
-DATA_DIR="${1:-~/rds/hpc-work/flsim/fvm_solver/artefacts/fvm_gen_datasets}"
+DATA_DIR="${1:-/home/nk624/rds/hpc-work/flsim/fvm_solver/artefacts/fvm_gen_datasets}"
 PORT="${2:-8050}"
 
 # ---- open a single multiplexed connection (one password + OTP prompt) ----

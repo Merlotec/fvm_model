@@ -1,9 +1,9 @@
 {
     "problem": "ellipse",
-    "mu_b_gen_mean": 0.4,
-    "mu_b_gen_stdev": 4.0,
+    "mu_b_gen_mean": -2.0,
+    "mu_b_gen_stdev": 1.0,
     "mu_b_gen_count": 100,
-    "mu_b_values": [0.001, 0.003162, 0.01, 0.03162, 0.1],
+    "mu_b_values": null,
     "phys_overrides": {},
     "output_subdir": "fvm_gen_datasets",
     "reuse_mesh": false,
