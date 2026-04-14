@@ -27,9 +27,7 @@ class SweepConfig:
     mu_b_gen_stdev: float | None = None
 
     # Explicit list of mu_b values. Set to null in JSON to use random sampling.
-    mu_b_values: list[float] | None = field(default_factory=lambda: list(
-        np.logspace(-3, -1, 5)   # 5 values from 1e-3 to 1e-1
-    ))
+    mu_b_values: list[float] | None = None
 
     # e.g. {"viscosity": 2e-3, "gamma": 1.4}
     phys_overrides: dict[str, Any] = field(default_factory=dict)
