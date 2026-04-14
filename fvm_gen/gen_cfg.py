@@ -15,7 +15,12 @@ import numpy as np
 class SweepConfig:
     problem: str = "ellipse"   # "ellipse" | "nozzle"
 
-    mu_b_values: list[float] = field(default_factory=lambda: list(
+    mu_b_gen_count: int | None = None # Set if using random generation of mu_b values.
+    mu_b_gen_mean: float | None = None
+    mu_b_gen_stdev: float | None = None
+
+    # If set to None, gen params must be provided.
+    mu_b_values: list[float] | None = field(default_factory=lambda: list(
         np.logspace(-3, -1, 5)   # 5 values from 1e-3 to 1e-1
     ))
 
