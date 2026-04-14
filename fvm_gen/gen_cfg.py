@@ -50,6 +50,9 @@ class SweepConfig:
                 raise ValueError(
                     f"mu_b_values is None but required gen params are missing: {missing}"
                 )
+            assert self.mu_b_gen_mean is not None
+            assert self.mu_b_gen_stdev is not None
+            assert self.mu_b_gen_count is not None
             log_samples = np.random.normal(
                 self.mu_b_gen_mean, self.mu_b_gen_stdev, size=self.mu_b_gen_count
             )

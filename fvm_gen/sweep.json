@@ -6,5 +6,5 @@
     "mu_b_values": null,
     "phys_overrides": {},
     "output_subdir": "fvm_gen_datasets",
-    "reuse_mesh": false
+    "reuse_mesh": true
 }

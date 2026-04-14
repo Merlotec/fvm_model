@@ -139,6 +139,7 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
     bound_edgs = mesh_dict["bound_edgs"]
 
     # ---- sweep over mu_b values ----
+    assert sweep_cfg.mu_b_values is not None, "mu_b_values must be set by __post_init__"
     n_runs = len(sweep_cfg.mu_b_values)
     c_print(f"\nStarting sweep: {n_runs} mu_b value(s)\n", "cyan")
 
