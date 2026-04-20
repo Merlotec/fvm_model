@@ -43,10 +43,6 @@ from run_fvm import generate_mesh, init_conds_ellipses, init_conds_nozzle
 from gen_cfg import SweepConfig
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _make_cfg(problem: str) -> ConfigFVM:
     if problem == "ellipse":
         return ConfigEllipse()
@@ -83,10 +79,6 @@ def _init_conds(cfg, mesh, edge_tag, bound_edgs, phy_setup):
     else:
         raise ValueError(f"Unknown problem_setup '{cfg.problem_setup}'")
 
-
-# ---------------------------------------------------------------------------
-# Core sweep runner
-# ---------------------------------------------------------------------------
 
 def sweep_cfg_from_file(path: str) -> SweepConfig:
     """Load a SweepConfig from a JSON file."""
@@ -170,7 +162,6 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
     c_print("Sweep finished.", "cyan")
 
 
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

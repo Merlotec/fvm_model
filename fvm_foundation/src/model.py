@@ -1,18 +1,28 @@
 import torch
-from torch import nn
-import lightning as L
+import torch.nn as nn
+
+from patch import StackingPatchEmbedding
+from transformer import FluidVisionTransformer
+from decoder import FluidDecoder
 
 
-class FiniteVolumeModel(nn.Module):
-    def __init__(self, d_model: int, nhead: int, num_layers: int):
+class FluidVisionModel(nn.Module):
+    def __init__(self, num_obs: int, num_patches: int, patch_size: int, emb_dim: int, num_channels: int = 3):
         super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
 
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.classifier = nn.Linear(d_model, 10)
+        self.num_patches = num_patches
+        self.emb_dim = emb_dim
+        self.num_obs = num_obs
+        
+        self.patch_embed = StackingPatchEmbedding(num_obs, num_channels, patch_size, emb_dim)
+        self.vision_transformer = FluidVisionTransformer(emb_dim)
+        self.decoder = FluidDecoder(emb_dim, num_channels)
+
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches, emb_dim))
         pass
 
     def forward(self, x):
-        x = x.transformer_encoder(x)
-        x = x.mean(dim=0)
-        return self.classifier(x)
+        x = self.patch_embed(x)
+        x = self.vision_transformer(x)
+        x = self.decoder(x)
+        return x
