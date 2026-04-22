@@ -129,7 +129,13 @@ def run_inference(
         emb_dim      = EMB_DIM,
         num_channels = N_CHANNELS,
     ).to(device)
-    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
+    # Lightning checkpoints nest weights under 'state_dict' with a 'model.' prefix
+    if 'state_dict' in ckpt:
+        state = {k.removeprefix('model.'): v for k, v in ckpt['state_dict'].items()}
+    else:
+        state = ckpt
+    model.load_state_dict(state)
     model.eval()
     c_print(f'Loaded checkpoint: {checkpoint}', color='green')
 

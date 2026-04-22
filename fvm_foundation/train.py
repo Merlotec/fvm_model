@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint
 from cprint import c_print
 
 # fvm_solver must be on sys.path to unpickle FVMMesh from shared_mesh.pkl
@@ -24,8 +26,9 @@ DATASET_DIR = Path(__file__).resolve().parents[2] / 'data' / 'fvm_gen_datasets'
 RESOLUTION  = (224, 224)
 PATCH_SIZE  = 16
 EMB_DIM     = 768
-N_CHANNELS  = 4   # Vx, Vy, rho, T
-WINDOW_SIZE = 10   # number of input frames per sample
+N_CHANNELS  = 4
+WINDOW_SIZE = 10
+
 
 def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) -> MeshRenderer:
     """Load or build a MeshRenderer from the shared mesh, caching to disk."""
@@ -44,8 +47,8 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) 
         mesh_dict = pickle.load(f)
     fvm_mesh = mesh_dict['mesh']
 
-    vertices  = fvm_mesh.vertices.cpu().numpy()   # (N, 2)
-    triangles = fvm_mesh.triangles.cpu().numpy()  # (M, 3)
+    vertices  = fvm_mesh.vertices.cpu().numpy()
+    triangles = fvm_mesh.triangles.cpu().numpy()
 
     c_print('Building renderer (trifinder precomputation)...', color='yellow')
     renderer = MeshRenderer(vertices, triangles, resolution=resolution, device=device)
@@ -54,18 +57,13 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) 
     return renderer
 
 
-
-
 class RenderedFVMDataset(Dataset):
     """
     Rolling-window samples from one simulation run, rendered to pixel grids.
 
     Each sample is (window, target):
-        window : (NUM_OBS * N_channels, H, W) — window_size frames stacked as channels
-        target : (N_channels, H, W)           — the frame immediately after the window
-
-    Values are denormalised to physical units before rendering so the model
-    sees consistent scales across timesteps.
+        window : (WINDOW_SIZE * N_channels, H, W)
+        target : (N_channels, H, W)
     """
 
     def __init__(self, sim_dir: Path, renderer: MeshRenderer, window_size: int):
@@ -73,8 +71,8 @@ class RenderedFVMDataset(Dataset):
             [f for f in os.listdir(sim_dir) if f.startswith('t_') and f.endswith('.npz')],
             key=lambda f: float(f[2:-4]),
         )
-        self.paths    = [sim_dir / f for f in files]
-        self.renderer = renderer
+        self.paths       = [sim_dir / f for f in files]
+        self.renderer    = renderer
         self.window_size = window_size
 
     def __len__(self) -> int:
@@ -84,101 +82,148 @@ class RenderedFVMDataset(Dataset):
         window = torch.cat(
             [self._render(self.paths[idx + i]) for i in range(self.window_size)],
             dim=0,
-        )  # (WINDOW_SIZE * N_channels, H, W)
-        target = self._render(self.paths[idx + self.window_size])  # (N_channels, H, W)
+        )
+        target = self._render(self.paths[idx + self.window_size])
         return window, target
 
     def _render(self, path: Path) -> torch.Tensor:
         d      = np.load(path)
         values = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
-        return self.renderer.render_cell(values)   # (N_channels, H, W)
+        return self.renderer.render_cell_smooth(values)
 
 
-def train_on_dir(
-    sim_dir: Path,
-    renderer: MeshRenderer,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: str,
-    window_size: int,
-) -> float:
-    dataset = RenderedFVMDataset(sim_dir, renderer, window_size)
-    if len(dataset) == 0:
-        c_print(f'  Skipping {sim_dir.name} — fewer than 2 timesteps', color='yellow')
-        return float('nan')
+# ---------------------------------------------------------------------------
+# Lightning DataModule
+# ---------------------------------------------------------------------------
 
-    loader = DataLoader(dataset, batch_size=4, shuffle=True, pin_memory=(device == 'cuda'))
-    model.train()
+class FVMDataModule(L.LightningDataModule):
+    def __init__(
+        self,
+        data_dir:    Path,
+        window_size: int  = WINDOW_SIZE,
+        batch_size:  int  = 4,
+        num_workers: int  = 4,
+    ):
+        super().__init__()
+        self.data_dir    = Path(data_dir)
+        self.window_size = window_size
+        self.batch_size  = batch_size
+        self.num_workers = num_workers
+        self._renderer: MeshRenderer | None = None
 
-    total_loss = 0.0
-    for grid_t, grid_t1 in loader:
-        grid_t  = grid_t.to(device)   # (B, N_channels, H, W)
-        grid_t1 = grid_t1.to(device)  # (B, N_channels, H, W)
+    def setup(self, stage: str | None = None):
+        # Renderer is built on CPU here; Lightning moves the model to the right
+        # device automatically. The renderer tensors stay on CPU and are moved
+        # to device inside each worker via pin_memory + non_blocking transfer.
+        self._renderer = build_renderer(self.data_dir, RESOLUTION, device='cpu')
 
-        optimizer.zero_grad()
-        pred = model(grid_t)
-        loss = criterion(pred, grid_t1)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+        subdirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
+        datasets = [
+            RenderedFVMDataset(d, self._renderer, self.window_size)
+            for d in subdirs
+        ]
+        datasets = [ds for ds in datasets if len(ds) > 0]
+        if not datasets:
+            raise RuntimeError(f'No usable simulation directories found in {self.data_dir}')
+        self._dataset = ConcatDataset(datasets)
+        c_print(f'Dataset: {len(self._dataset)} samples across {len(datasets)} runs', color='bright_green')
 
-    return total_loss / len(loader)
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self._dataset,
+            batch_size  = self.batch_size,
+            shuffle     = True,
+            num_workers = self.num_workers,
+            pin_memory  = True,
+            persistent_workers = self.num_workers > 0,
+        )
 
 
-def main(data_dir: Path = DATASET_DIR):
-    if torch.cuda.is_available():
-        device = 'cuda'
-    elif torch.backends.mps.is_available():
-        device = 'mps'
-    else:
-        device = 'cpu'
-    n_epochs  = 20
-    lr        = 1e-4
-    save_path = Path(__file__).parent / 'checkpoints' / 'model.pt'
-    save_path.parent.mkdir(exist_ok=True)
+# ---------------------------------------------------------------------------
+# Lightning Module
+# ---------------------------------------------------------------------------
 
-    data_dir = Path(data_dir)
-    subdirs  = sorted([p for p in data_dir.iterdir() if p.is_dir()])
-    if not subdirs:
-        raise RuntimeError(f'No simulation directories found in {data_dir}')
-    c_print(f'Found {len(subdirs)} simulation directories in {data_dir}', color='bright_green')
+class FVMLightningModel(L.LightningModule):
+    def __init__(self, lr: float = 1e-4):
+        super().__init__()
+        self.save_hyperparameters()
+        H, W        = RESOLUTION
+        num_patches = (H // PATCH_SIZE) * (W // PATCH_SIZE)
+        self.model = FluidVisionModel(
+            num_obs      = WINDOW_SIZE,
+            num_patches  = num_patches,
+            patch_size   = PATCH_SIZE,
+            emb_dim      = EMB_DIM,
+            num_channels = N_CHANNELS,
+        )
+        self.criterion = nn.MSELoss()
 
-    renderer = build_renderer(data_dir, RESOLUTION, device)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
-    H, W        = RESOLUTION
-    num_patches = (H // PATCH_SIZE) * (W // PATCH_SIZE)
-    model = FluidVisionModel(
-        num_obs      = WINDOW_SIZE,
-        num_patches  = num_patches,
-        patch_size   = PATCH_SIZE,
-        emb_dim      = EMB_DIM,
-        num_channels = N_CHANNELS,
-    ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        window, target = batch
+        pred = self(window)
+        loss = self.criterion(pred, target)
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        return loss
 
-    for epoch in range(n_epochs):
-        c_print(f'\nEpoch {epoch + 1}/{n_epochs}', color='bright_cyan')
-        losses = []
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
-        for subdir in subdirs:
-            loss = train_on_dir(subdir, renderer, model, optimizer, criterion, device, WINDOW_SIZE)
-            c_print(f'  {subdir.name}: loss={loss:.5f}', color='bright_green')
-            if not np.isnan(loss):
-                losses.append(loss)
 
-        mean_loss = float(np.mean(losses)) if losses else float('nan')
-        c_print(f'  epoch mean loss: {mean_loss:.5f}', color='bright_yellow')
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    torch.save(model.state_dict(), save_path)
-    c_print(f'\nSaved model to {save_path}', color='bright_magenta')
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Train FluidVisionModel with PyTorch Lightning')
+    parser.add_argument('--data-dir',    type=Path, default=DATASET_DIR,
+                        help=f'Dataset root directory (default: {DATASET_DIR})')
+    parser.add_argument('--epochs',      type=int,  default=20)
+    parser.add_argument('--batch-size',  type=int,  default=4)
+    parser.add_argument('--lr',          type=float, default=1e-4)
+    parser.add_argument('--num-workers', type=int,  default=4)
+    parser.add_argument('--devices',     type=int,  default=-1,
+                        help='Number of GPUs per node (-1 = all available)')
+    parser.add_argument('--num-nodes',   type=int,  default=1)
+    parser.add_argument('--precision',   type=str,  default='32',
+                        help='Training precision: 32, 16-mixed, bf16-mixed')
+    args = parser.parse_args()
+
+    checkpoint_dir = Path(__file__).parent / 'checkpoints'
+    checkpoint_dir.mkdir(exist_ok=True)
+
+    checkpoint_cb = ModelCheckpoint(
+        dirpath   = checkpoint_dir,
+        filename  = 'model-{epoch:03d}-{train_loss:.5f}',
+        save_last = True,
+        monitor   = 'train_loss',
+        mode      = 'min',
+    )
+
+    datamodule = FVMDataModule(
+        data_dir    = args.data_dir,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
+    )
+
+    lightning_model = FVMLightningModel(lr=args.lr)
+
+    trainer = L.Trainer(
+        max_epochs    = args.epochs,
+        devices       = args.devices,
+        num_nodes     = args.num_nodes,
+        strategy      = 'ddp' if (args.devices != 1 or args.num_nodes > 1) else 'auto',
+        precision     = args.precision,
+        callbacks     = [checkpoint_cb],
+        log_every_n_steps = 10,
+    )
+
+    trainer.fit(lightning_model, datamodule=datamodule)
+    c_print(f'\nBest checkpoint: {checkpoint_cb.best_model_path}', color='bright_magenta')
 
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data-dir', type=Path, default=DATASET_DIR,
-                        help=f'Dataset root directory (default: {DATASET_DIR})')
-    args = parser.parse_args()
-    main(args.data_dir)
+    main()
