@@ -136,9 +136,8 @@ def run_inference(
     # ---- input files ----
     all_files = _find_timestep_files(sim_dir)
     if len(all_files) < WINDOW_SIZE:
-        raise RuntimeError(
-            f'{sim_dir} has only {len(all_files)} timesteps; need at least {WINDOW_SIZE} for seed.'
-        )
+        c_print(f'Skipping {sim_dir} — only {len(all_files)} timesteps (need {WINDOW_SIZE}).', color='yellow')
+        return
 
     if n_steps is None:
         n_steps = max(1, len(all_files) - WINDOW_SIZE)

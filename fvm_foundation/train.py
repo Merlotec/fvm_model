@@ -20,7 +20,7 @@ from model import FluidVisionModel
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
 from renderer import MeshRenderer
 
-DATASET_DIR = _SOLVER_DIR / 'artefacts' / 'fvm_gen_datasets'
+DATASET_DIR = Path(__file__).resolve().parents[2] / 'data' / 'fvm_gen_datasets'
 RESOLUTION  = (224, 224)
 PATCH_SIZE  = 16
 EMB_DIM     = 768

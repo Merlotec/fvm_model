@@ -34,7 +34,8 @@ for _p in (_SOLVER_DIR, _TIME_FVM_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from base_cfg import ARTEFACT_DIR
+_DEFAULT_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
+
 from time_fvm.fvm_equation import FVMEquation, PhysicalSetup
 from time_fvm.fvm_mesh import FVMMesh
 from time_fvm.config_fvm import ConfigFVM, ConfigEllipse, ConfigNozzle
@@ -106,7 +107,7 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
         c_print(f"Device (FVM_DEVICE not set): {base_cfg.device}", "cyan")
 
     # Output root
-    out_root = os.path.join(ARTEFACT_DIR, sweep_cfg.output_subdir)
+    out_root = os.path.join(_DEFAULT_DATA_DIR, sweep_cfg.output_subdir)
     os.makedirs(out_root, exist_ok=True)
     c_print(f"Output root: {out_root}", "cyan")
 
