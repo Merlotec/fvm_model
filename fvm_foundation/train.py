@@ -112,11 +112,10 @@ class FVMDataModule(L.LightningDataModule):
         self._renderer: MeshRenderer | None = None
 
     def setup(self, stage: str | None = None):
-        # Renderer is built on CPU here; Lightning moves the model to the right
-        # device automatically. The renderer tensors stay on CPU and are moved
-        # to device inside each worker via pin_memory + non_blocking transfer.
+        c_print('Building renderer...', color='yellow')
         self._renderer = build_renderer(self.data_dir, RESOLUTION, device='cpu')
 
+        c_print('Scanning simulation directories...', color='yellow')
         subdirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
         datasets = [
             RenderedFVMDataset(d, self._renderer, self.window_size)
