@@ -176,4 +176,9 @@ def main(data_dir: Path = DATASET_DIR):
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data-dir', type=Path, default=DATASET_DIR,
+                        help=f'Dataset root directory (default: {DATASET_DIR})')
+    args = parser.parse_args()
+    main(args.data_dir)
