@@ -33,14 +33,21 @@ Navigation
 """
 
 import os
+import sys
 import argparse
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
 import dash
 from dash import dcc, html, Input, Output, State, callback_context
 
+# Make fvm_gen importable so we can use MeshRenderer
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
+from renderer import MeshRenderer
+
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
+RESOLUTION  = (512, 512)   # higher than training res for display quality
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +78,25 @@ def load_mesh(run_dir: str) -> dict:
     return {k: d[k] for k in d.files}
 
 
+def build_renderer(run_dir: str, resolution: tuple[int, int]) -> MeshRenderer:
+    """Load or build a MeshRenderer for this run, caching alongside mesh_props.npz."""
+    H, W = resolution
+    cache_path = os.path.join(run_dir, f"renderer_cache_{H}x{W}.pt")
+
+    if os.path.exists(cache_path):
+        return MeshRenderer.from_cache(cache_path, device="cpu")
+
+    mesh = load_mesh(run_dir)
+    renderer = MeshRenderer(
+        vertices  = mesh["vertices"],
+        triangles = mesh["triangles"],
+        resolution = resolution,
+        device    = "cpu",
+    )
+    renderer.save_cache(cache_path)
+    return renderer
+
+
 def find_timestep_files(run_dir: str) -> list[str]:
     files = [f for f in os.listdir(run_dir) if f.startswith("t_") and f.endswith(".npz")]
     files.sort(key=lambda f: float(f[2:-4]))
@@ -97,55 +123,25 @@ def closest_idx(files: list[str], target_t: float) -> int:
 # Plot construction
 # ---------------------------------------------------------------------------
 
-_CAMERA = dict(
-    eye=dict(x=0, y=0, z=1),
-    up=dict(x=0, y=1, z=0),
-    center=dict(x=0, y=0, z=0),
-    projection=dict(type="orthographic"),
-)
-
-_SCENE = dict(
-    camera=_CAMERA,
-    dragmode="pan",      # drag = translate; scroll = zoom; rotation disabled
-    aspectmode="data",
-    bgcolor="white",
-    xaxis=dict(visible=False, showgrid=False, zeroline=False),
-    yaxis=dict(visible=False, showgrid=False, zeroline=False),
-    zaxis=dict(visible=False, showgrid=False, zeroline=False, range=[-0.01, 0.01]),
-)
-
-_LIGHTING = dict(ambient=1.0, diffuse=0.0, specular=0.0, roughness=1.0, fresnel=0.0)
-
-
-def make_field_figure(verts: np.ndarray, tris: np.ndarray, values: np.ndarray, title: str) -> go.Figure:
+def make_field_figure(grid: np.ndarray, title: str) -> go.Figure:
     """
-    2D coloured triangular-mesh figure rendered as a top-down Mesh3d.
-    Per-face (cell-centred) colouring via intensitymode='cell'.
+    Display one (H, W) rendered field channel as a heatmap.
+
+    grid: (H, W) float32 array from MeshRenderer.
     """
-    fig = go.Figure(go.Mesh3d(
-        x=verts[:, 0],
-        y=verts[:, 1],
-        z=np.zeros(len(verts), dtype=np.float32),
-        i=tris[:, 0].astype(int),
-        j=tris[:, 1].astype(int),
-        k=tris[:, 2].astype(int),
-        intensity=values,
-        intensitymode="cell",
-        colorscale="Viridis",
-        showscale=True,
-        flatshading=True,
-        lighting=_LIGHTING,
-        colorbar=dict(thickness=12, len=0.85),
+    fig = go.Figure(go.Heatmap(
+        z          = grid,
+        colorscale = "Viridis",
+        showscale  = True,
+        colorbar   = dict(thickness=12, len=0.85),
     ))
-    # uirevision must be a constant per field so Plotly never resets the
-    # camera regardless of which timestep or run is shown.  Setting it on
-    # both layout and layout.scene is required for 3D scenes.
     fig.update_layout(
-        title=dict(text=title, font=dict(size=13), x=0.5, xanchor="center"),
-        scene=dict(**_SCENE, uirevision=title),
-        margin=dict(l=0, r=0, t=36, b=0),
-        height=320,
-        uirevision=title,
+        title  = dict(text=title, font=dict(size=13), x=0.5, xanchor="center"),
+        xaxis  = dict(visible=False, scaleanchor="y"),
+        yaxis  = dict(visible=False, autorange="reversed"),
+        margin = dict(l=0, r=0, t=36, b=0),
+        height = 320,
+        uirevision = title,
     )
     return fig
 
@@ -157,13 +153,12 @@ def make_field_figure(verts: np.ndarray, tris: np.ndarray, values: np.ndarray, t
 def build_app(root_dir: str) -> dash.Dash:
     run_dirs = find_run_dirs(os.path.abspath(root_dir))
 
-    # Pre-load mesh and file lists for all runs
-    meshes: dict[str, dict]        = {d: load_mesh(d)            for d in run_dirs}
-    all_files: dict[str, list[str]] = {d: find_timestep_files(d) for d in run_dirs}
+    print("Precomputing renderers...")
+    renderers:  dict[str, MeshRenderer] = {d: build_renderer(d, RESOLUTION) for d in run_dirs}
+    all_files:  dict[str, list[str]]    = {d: find_timestep_files(d)         for d in run_dirs}
+    print("Ready.")
 
     app = dash.Dash(__name__, title="FVM Viewer")
-
-    # ---- Layout ----
 
     run_options = [
         {"label": os.path.basename(d), "value": i}
@@ -200,7 +195,6 @@ def build_app(root_dir: str) -> dash.Dash:
             [dcc.Graph(id=f"plot-{i}", config={
                 "scrollZoom": True,
                 "displayModeBar": True,
-                "modeBarButtonsToRemove": ["orbitRotation", "tableRotation", "resetCameraLastSave3d", "resetCameraDefault3d"],
                 "displaylogo": False,
             }) for i in range(4)],
             style={
@@ -244,10 +238,6 @@ def build_app(root_dir: str) -> dash.Dash:
         dcc.Interval(id="_key-interval", interval=300, max_intervals=1),
     ], style={"display": "flex", "flexDirection": "column", "height": "100vh", "fontFamily": "sans-serif"})
 
-    # ---- Keyboard navigation (clientside) ----
-    # Fires once after 300 ms to attach a keydown listener that clicks the
-    # Prev/Next buttons, giving Left/Right arrow key navigation in the browser.
-
     app.clientside_callback(
         """
         function(_n) {
@@ -266,8 +256,6 @@ def build_app(root_dir: str) -> dash.Dash:
         prevent_initial_call=True,
     )
 
-    # ---- Callbacks ----
-
     @app.callback(
         Output("state", "data"),
         Input("btn-prev", "n_clicks"),
@@ -283,10 +271,9 @@ def build_app(root_dir: str) -> dash.Dash:
 
         if triggered == "run-selector" and run_sel is not None:
             old_run = run_dirs[state["run_idx"]]
-            old_t = t_of_file(all_files[old_run][state["step_idx"]]) if all_files[old_run] else 0.0
-            state["run_idx"] = run_sel
-            new_run = run_dirs[run_sel]
-            state["step_idx"] = closest_idx(all_files[new_run], old_t)
+            old_t   = t_of_file(all_files[old_run][state["step_idx"]]) if all_files[old_run] else 0.0
+            state["run_idx"]  = run_sel
+            state["step_idx"] = closest_idx(all_files[run_dirs[run_sel]], old_t)
 
         elif triggered == "btn-prev":
             run = run_dirs[state["run_idx"]]
@@ -316,18 +303,16 @@ def build_app(root_dir: str) -> dash.Dash:
         step_idx = state["step_idx"]
         run_dir  = run_dirs[run_idx]
         files    = all_files[run_dir]
-        mesh     = meshes[run_dir]
-
-        verts = mesh["vertices"]
-        tris  = mesh["triangles"]
+        renderer = renderers[run_dir]
 
         t, cell_prims = load_step(files[step_idx])
-        n = len(files)
+        grid = renderer.render_cell_smooth(cell_prims).numpy()  # (4, H, W)
 
+        n        = len(files)
         run_name = os.path.basename(run_dir)
         header   = f"{run_name}   |   step {step_idx + 1}/{n}   |   t = {t:.4g}"
 
-        figs = [make_field_figure(verts, tris, cell_prims[:, i], FIELD_NAMES[i]) for i in range(4)]
+        figs = [make_field_figure(grid[i], FIELD_NAMES[i]) for i in range(4)]
         return (*figs, header, n - 1, step_idx)
 
     return app

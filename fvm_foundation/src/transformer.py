@@ -8,5 +8,5 @@ class FluidVisionTransformer(nn.Module):
         pass
 
     def forward(self, x):
-        x = x.transformer_encoder(x)
+        x = self.transformer_encoder(x)
         return x
