@@ -221,6 +221,7 @@ def main():
         log_every_n_steps = 10,
     )
 
+    torch.set_float32_matmul_precision('high')
     trainer.fit(lightning_model, datamodule=datamodule)
     c_print(f'\nBest checkpoint: {checkpoint_cb.best_model_path}', color='bright_magenta')
 
