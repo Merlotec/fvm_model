@@ -190,6 +190,8 @@ def main():
     parser.add_argument('--num-nodes',   type=int,  default=1)
     parser.add_argument('--precision',   type=str,  default='32',
                         help='Training precision: 32, 16-mixed, bf16-mixed')
+    parser.add_argument('--resume',      type=Path, default=None,
+                        help='Path to a Lightning checkpoint to resume from (e.g. checkpoints/last.ckpt)')
     args = parser.parse_args()
 
     checkpoint_dir = Path(__file__).parent / 'checkpoints'
@@ -222,7 +224,7 @@ def main():
     )
 
     torch.set_float32_matmul_precision('high')
-    trainer.fit(lightning_model, datamodule=datamodule)
+    trainer.fit(lightning_model, datamodule=datamodule, ckpt_path=args.resume)
     c_print(f'\nBest checkpoint: {checkpoint_cb.best_model_path}', color='bright_magenta')
 
 
