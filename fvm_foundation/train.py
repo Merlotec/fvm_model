@@ -83,8 +83,9 @@ class RenderedFVMDataset(Dataset):
             [self._render(self.paths[idx + i]) for i in range(self.window_size)],
             dim=0,
         )
-        target = self._render(self.paths[idx + self.window_size])
-        return window, target
+        target    = self._render(self.paths[idx + self.window_size])
+        last_frame = window[-N_CHANNELS:]   # last frame already in window
+        return window, target - last_frame
 
     def _render(self, path: Path) -> torch.Tensor:
         d      = np.load(path)

@@ -178,7 +178,8 @@ def run_inference(
             # Stack window into (1, WINDOW_SIZE * N_CHANNELS, H, W)
             inp = torch.cat(window, dim=0).unsqueeze(0)   # (1, W*C, H, W)
 
-            pred = model(inp).squeeze(0)                  # (N_CHANNELS, H, W)
+            delta = model(inp).squeeze(0)                 # (N_CHANNELS, H, W)
+            pred  = window[-1] + delta                    # add delta to last frame
 
             _save_frame(out_dir, t_next, pred.cpu().numpy(), is_seed=False)
             c_print(f'  pred  t={t_next:.4g}  [{step + 1}/{n_steps}]', color='bright_green')
