@@ -24,7 +24,7 @@ from renderer import MeshRenderer
 
 DATASET_DIR = Path(__file__).resolve().parents[2] / 'data' / 'fvm_gen_datasets'
 RESOLUTION  = (224, 224)
-PATCH_SIZE  = 16
+PATCH_SIZE  = 32
 EMB_DIM     = 768
 N_CHANNELS  = 4
 WINDOW_SIZE = 10

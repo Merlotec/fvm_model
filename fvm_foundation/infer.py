@@ -102,10 +102,6 @@ def _save_frame(out_dir: Path, t: float, grid: np.ndarray, is_seed: bool) -> Non
     )
 
 
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
 def run_inference(
     sim_dir:    Path,
     checkpoint: Path,
@@ -116,10 +112,8 @@ def run_inference(
     device = _select_device()
     c_print(f'Device: {device}', color='cyan')
 
-    # ---- renderer ----
     renderer = build_renderer(data_dir, RESOLUTION, device)
 
-    # ---- model ----
     H, W        = RESOLUTION
     num_patches = (H // PATCH_SIZE) * (W // PATCH_SIZE)
     model = FluidVisionModel(
