@@ -1,0 +1,14 @@
+{
+    "resolution": [224, 224],
+    "patch_size": 32,
+    "emb_dim": 768,
+    "n_channels": 4,
+    "window_size": 10,
+    "epochs": 20,
+    "batch_size": 4,
+    "lr": 1e-4,
+    "num_workers": 4,
+    "devices": -1,
+    "num_nodes": 1,
+    "precision": "32"
+}

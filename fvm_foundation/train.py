@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import pickle
@@ -22,12 +23,15 @@ from model import FluidVisionModel
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
 from renderer import MeshRenderer
 
+with open(Path(__file__).resolve().parent / 'hyperparams.json') as _f:
+    _HP = json.load(_f)
+
 DATASET_DIR = Path(__file__).resolve().parents[2] / 'data' / 'fvm_gen_datasets'
-RESOLUTION  = (224, 224)
-PATCH_SIZE  = 32
-EMB_DIM     = 768
-N_CHANNELS  = 4
-WINDOW_SIZE = 10
+RESOLUTION  = tuple(_HP['resolution'])
+PATCH_SIZE  = _HP['patch_size']
+EMB_DIM     = _HP['emb_dim']
+N_CHANNELS  = _HP['n_channels']
+WINDOW_SIZE = _HP['window_size']
 
 
 def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) -> MeshRenderer:
@@ -93,9 +97,6 @@ class RenderedFVMDataset(Dataset):
         return self.renderer.render_cell_smooth(values)
 
 
-# ---------------------------------------------------------------------------
-# Lightning DataModule
-# ---------------------------------------------------------------------------
 
 class FVMDataModule(L.LightningDataModule):
     def __init__(
@@ -139,9 +140,6 @@ class FVMDataModule(L.LightningDataModule):
         )
 
 
-# ---------------------------------------------------------------------------
-# Lightning Module
-# ---------------------------------------------------------------------------
 
 class FVMLightningModel(L.LightningModule):
     def __init__(self, lr: float = 1e-4):
@@ -172,23 +170,19 @@ class FVMLightningModel(L.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Train FluidVisionModel with PyTorch Lightning')
     parser.add_argument('--data-dir',    type=Path, default=DATASET_DIR,
                         help=f'Dataset root directory (default: {DATASET_DIR})')
-    parser.add_argument('--epochs',      type=int,  default=20)
-    parser.add_argument('--batch-size',  type=int,  default=4)
-    parser.add_argument('--lr',          type=float, default=1e-4)
-    parser.add_argument('--num-workers', type=int,  default=4)
-    parser.add_argument('--devices',     type=int,  default=-1,
+    parser.add_argument('--epochs',      type=int,   default=_HP['epochs'])
+    parser.add_argument('--batch-size',  type=int,   default=_HP['batch_size'])
+    parser.add_argument('--lr',          type=float, default=_HP['lr'])
+    parser.add_argument('--num-workers', type=int,   default=_HP['num_workers'])
+    parser.add_argument('--devices',     type=int,   default=_HP['devices'],
                         help='Number of GPUs per node (-1 = all available)')
-    parser.add_argument('--num-nodes',   type=int,  default=1)
-    parser.add_argument('--precision',   type=str,  default='32',
+    parser.add_argument('--num-nodes',   type=int,   default=_HP['num_nodes'])
+    parser.add_argument('--precision',   type=str,   default=_HP['precision'],
                         help='Training precision: 32, 16-mixed, bf16-mixed')
     parser.add_argument('--resume',      type=Path, default=None,
                         help='Path to a Lightning checkpoint to resume from (e.g. checkpoints/last.ckpt)')

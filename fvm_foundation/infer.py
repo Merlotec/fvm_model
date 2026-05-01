@@ -29,6 +29,7 @@ Each .npz contains:
     is_seed   : bool
 """
 
+import json
 import sys
 import argparse
 from pathlib import Path
@@ -48,15 +49,16 @@ from model import FluidVisionModel
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
 from renderer import MeshRenderer
 
-from train import (
-    DATASET_DIR,
-    RESOLUTION,
-    PATCH_SIZE,
-    EMB_DIM,
-    N_CHANNELS,
-    WINDOW_SIZE,
-    build_renderer,
-)
+with open(Path(__file__).resolve().parent / 'hyperparams.json') as _f:
+    _HP = json.load(_f)
+
+RESOLUTION  = tuple(_HP['resolution'])
+PATCH_SIZE  = _HP['patch_size']
+EMB_DIM     = _HP['emb_dim']
+N_CHANNELS  = _HP['n_channels']
+WINDOW_SIZE = _HP['window_size']
+
+from train import DATASET_DIR, build_renderer
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 
