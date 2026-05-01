@@ -21,8 +21,9 @@ class FluidDecoder(nn.Module):
         x = x.transpose(1, 2)
 
         # Convert into grid for the CNN.
-        # [batch, 768, 14, 14]
-        x = x.unflatten(2, (14, 14))
+        n = x.shape[2]
+        grid = int(n ** 0.5)
+        x = x.unflatten(2, (grid, grid))
         
         # Use relu activation between upsampling steps to learn non linear fluid boundaries.
         x = F.relu(self.up1(x))
