@@ -62,6 +62,8 @@ from train import DATASET_DIR, build_renderer
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 
+_DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,6 +137,16 @@ def run_inference(
     model.eval()
     c_print(f'Loaded checkpoint: {checkpoint}', color='green')
 
+    delta_mean = delta_std = None
+    if _DELTA_STATS_PATH.exists():
+        with open(_DELTA_STATS_PATH) as _f:
+            _stats = json.load(_f)
+        delta_mean = torch.tensor(_stats['mean'], device=device).view(-1, 1, 1)
+        delta_std  = torch.tensor(_stats['std'],  device=device).view(-1, 1, 1)
+        c_print('Loaded delta normalisation stats', color='green')
+    else:
+        c_print('Warning: delta_stats.json not found — predictions will not be denormalised', color='yellow')
+
     # ---- input files ----
     all_files = _find_timestep_files(sim_dir)
     if len(all_files) < WINDOW_SIZE:
@@ -174,11 +186,12 @@ def run_inference(
             # Stack window into (1, WINDOW_SIZE * N_CHANNELS, H, W)
             inp = torch.cat(window, dim=0).unsqueeze(0)   # (1, W*C, H, W)
 
-            delta = model(inp).squeeze(0)                 # (N_CHANNELS, H, W)
-            pred  = window[-1] + delta                    # add delta to last frame
+            raw_delta = model(inp).squeeze(0)             # (N_CHANNELS, H, W)
+            delta = raw_delta * delta_std + delta_mean if delta_mean is not None else raw_delta
+            pred  = window[-1] + delta
 
             _save_frame(out_dir, t_next, pred.cpu().numpy(), is_seed=False)
-            c_print(f'  pred  t={t_next:.4g}  [{step + 1}/{n_steps}]', color='bright_green')
+            c_print(f'  pred  t={t_next:.4g}  [{step + 1}/{n_steps}]  raw={raw_delta.abs().mean():.4f}  delta={delta.abs().mean():.4f}', color='bright_green')
 
             # Slide window: drop oldest frame, append prediction
             window.pop(0)

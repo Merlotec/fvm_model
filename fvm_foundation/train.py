@@ -33,6 +33,8 @@ EMB_DIM     = _HP['emb_dim']
 N_CHANNELS  = _HP['n_channels']
 WINDOW_SIZE = _HP['window_size']
 
+DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
+
 
 def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) -> MeshRenderer:
     """Load or build a MeshRenderer from the shared mesh, caching to disk."""
@@ -59,6 +61,36 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) 
     renderer.save_cache(str(cache_path))
     c_print(f'Renderer cache saved to {cache_path}', color='green')
     return renderer
+
+
+def _compute_delta_stats(sim_dirs: list[Path], renderer, n_samples: int = 200):
+    """Sample consecutive frame pairs to estimate per-channel delta mean and std."""
+    all_pairs = []
+    for d in sim_dirs:
+        files = sorted(
+            [f for f in d.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
+            key=lambda f: float(f.stem[2:]),
+        )
+        for i in range(len(files) - 1):
+            all_pairs.append((files[i], files[i + 1]))
+
+    n = min(n_samples, len(all_pairs))
+    indices = torch.randperm(len(all_pairs))[:n].tolist()
+
+    def _render(p):
+        d = np.load(p)
+        vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
+        return renderer.render_cell_smooth(vals)
+
+    deltas = []
+    for i in indices:
+        path_a, path_b = all_pairs[i]
+        deltas.append(_render(path_b) - _render(path_a))
+
+    deltas = torch.stack(deltas)          # (n, C, H, W)
+    mean = deltas.mean(dim=(0, 2, 3))     # (C,)
+    std  = deltas.std(dim=(0, 2, 3)).clamp(min=1e-6)
+    return mean, std
 
 
 class RenderedFVMDataset(Dataset):
@@ -129,6 +161,12 @@ class FVMDataModule(L.LightningDataModule):
         self._dataset = ConcatDataset(datasets)
         c_print(f'Dataset: {len(self._dataset)} samples across {len(datasets)} runs', color='bright_green')
 
+        c_print('Computing delta statistics (sampling 200 frame pairs)...', color='yellow')
+        mean, std = _compute_delta_stats(subdirs, self._renderer)
+        with open(DELTA_STATS_PATH, 'w') as f:
+            json.dump({'mean': mean.tolist(), 'std': std.tolist()}, f)
+        c_print(f'Delta stats saved — mean={[f"{v:.4f}" for v in mean.tolist()]}  std={[f"{v:.4f}" for v in std.tolist()]}', color='green')
+
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self._dataset,
@@ -154,15 +192,29 @@ class FVMLightningModel(L.LightningModule):
             emb_dim      = EMB_DIM,
             num_channels = N_CHANNELS,
         )
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.L1Loss()
+        self.register_buffer('delta_mean', torch.zeros(N_CHANNELS, 1, 1))
+        self.register_buffer('delta_std',  torch.ones(N_CHANNELS, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
+    def on_fit_start(self) -> None:
+        if DELTA_STATS_PATH.exists():
+            with open(DELTA_STATS_PATH) as f:
+                stats = json.load(f)
+            self.delta_mean.copy_(torch.tensor(stats['mean'], device=self.device).view(N_CHANNELS, 1, 1))
+            self.delta_std.copy_(torch.tensor(stats['std'],  device=self.device).view(N_CHANNELS, 1, 1))
+            c_print('Loaded delta normalisation stats', color='green')
+        else:
+            c_print('Warning: delta_stats.json not found — training without delta normalisation', color='yellow')
+
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         window, target = batch
         pred = self(window)
-        loss = self.criterion(pred, target)
+        target_norm = (target - self.delta_mean) / self.delta_std
+        pred_norm   = (pred   - self.delta_mean) / self.delta_std
+        loss = self.criterion(pred_norm, target_norm)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
