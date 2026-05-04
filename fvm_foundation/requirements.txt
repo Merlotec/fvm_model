@@ -1,4 +1,8 @@
 torch
+lightning
 triton
-causal-conv1d>=1.2.0
+wheel
+setuptools
+packaging
+causal-conv1d>=1.2.0 --no-build-isolation # We need this flag to prevent it from rebuilding with a different pytorch version
 mamba-ssm

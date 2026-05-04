@@ -44,5 +44,5 @@ Thumbs.db
 
 # Data
 data
-checkpoints
+checkpoints*
 out

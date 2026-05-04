@@ -140,7 +140,7 @@ class MeshRenderer:
         self._out_buf[self._interior_idx] = interp
         out = self._out_buf.view(self._shape[0], self._shape[1], C)
 
-        return out[:, :, 0] if scalar else out.permute(2, 0, 1)  # (H,W) or (C,H,W)
+        return (out[:, :, 0] if scalar else out.permute(2, 0, 1)).clone()  # (H,W) or (C,H,W)
 
     def render_cell(
         self,
