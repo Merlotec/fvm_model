@@ -158,6 +158,28 @@ def make_field_figure(grid: np.ndarray, title: str) -> go.Figure:
     return fig
 
 
+def make_delta_figure(delta: np.ndarray, title: str) -> go.Figure:
+    maxabs = float(np.abs(delta).max()) or 1.0
+    fig = go.Figure(go.Heatmap(
+        z=delta, colorscale="RdBu_r", showscale=True,
+        zmid=0, zmin=-maxabs, zmax=maxabs,
+        colorbar=dict(thickness=10, len=0.85),
+    ))
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=12), x=0.5, xanchor="center"),
+        uirevision=title,
+        **_HEATMAP_LAYOUT,
+    )
+    return fig
+
+
+def _row_label(text: str) -> html.Div:
+    return html.Div(text, style={
+        "gridColumn": "1 / -1", "fontWeight": "600", "fontSize": "12px",
+        "padding": "4px 8px", "background": "#f0f0f0", "borderRadius": "3px",
+    })
+
+
 def _sidebar(run_options: list[dict]) -> html.Div:
     return html.Div([
         html.H4("Runs", style={"margin": "0 0 10px 0", "fontSize": "13px", "fontWeight": "600"}),
@@ -221,8 +243,13 @@ def build_app(root_dir: str) -> dash.Dash:
     opts = [{"label": os.path.basename(d), "value": i} for i, d in enumerate(run_dirs)]
 
     plot_area = dcc.Loading(type="circle", color="#4a90d9", children=html.Div(
-        [dcc.Graph(id=f"plot-{i}", config=_GRAPH_CFG) for i in range(4)],
-        style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "4px", "padding": "4px"},
+        [
+            _row_label("Fields"),
+            *[dcc.Graph(id=f"plot-{i}",  config=_GRAPH_CFG) for i in range(4)],
+            _row_label("Delta (current − previous)"),
+            *[dcc.Graph(id=f"delta-{i}", config=_GRAPH_CFG) for i in range(4)],
+        ],
+        style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr", "gap": "4px", "padding": "4px"},
     ))
 
     app.layout = html.Div([
@@ -266,8 +293,10 @@ def build_app(root_dir: str) -> dash.Dash:
         return state
 
     @app.callback(
-        Output("plot-0", "figure"), Output("plot-1", "figure"),
-        Output("plot-2", "figure"), Output("plot-3", "figure"),
+        Output("plot-0",  "figure"), Output("plot-1",  "figure"),
+        Output("plot-2",  "figure"), Output("plot-3",  "figure"),
+        Output("delta-0", "figure"), Output("delta-1", "figure"),
+        Output("delta-2", "figure"), Output("delta-3", "figure"),
         Output("header-info", "children"),
         Output("step-slider", "max"), Output("step-slider", "value"),
         Input("state", "data"),
@@ -278,10 +307,17 @@ def build_app(root_dir: str) -> dash.Dash:
         files    = all_files[run_dir]
         t, cell_prims = load_step(files[step_idx])
         grid = renderers[run_dir].render_cell_smooth(cell_prims).numpy()
+        if step_idx > 0:
+            _, prev_prims = load_step(files[step_idx - 1])
+            prev_grid = renderers[run_dir].render_cell_smooth(prev_prims).numpy()
+            delta = grid - prev_grid
+        else:
+            delta = np.zeros_like(grid)
         n    = len(files)
         header = f"{os.path.basename(run_dir)}   |   step {step_idx + 1}/{n}   |   t = {t:.4g}"
-        figs   = [make_field_figure(grid[i], FIELD_NAMES[i]) for i in range(4)]
-        return (*figs, header, n - 1, step_idx)
+        figs       = [make_field_figure(grid[i],  FIELD_NAMES[i])        for i in range(4)]
+        delta_figs = [make_delta_figure(delta[i], f"Δ{FIELD_NAMES[i]}")  for i in range(4)]
+        return (*figs, *delta_figs, header, n - 1, step_idx)
 
     return app
 
@@ -325,17 +361,15 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     app  = dash.Dash(__name__, title="FVM Viewer — Compare")
     opts = [{"label": name, "value": i} for i, name in enumerate(run_names)]
 
-    # 8 plots: top row = real (4), bottom row = generated (4)
-    row_label = lambda text: html.Div(text, style={
-        "gridColumn": "1 / -1", "fontWeight": "600", "fontSize": "12px",
-        "padding": "4px 8px", "background": "#f0f0f0", "borderRadius": "3px",
-    })
+    # 12 plots: real (4) + generated (4) + delta (4)
     plot_area = dcc.Loading(type="circle", color="#4a90d9", children=html.Div(
         [
-            row_label("Real"),
-            *[dcc.Graph(id=f"plot-real-{i}", config=_GRAPH_CFG) for i in range(4)],
-            row_label("Generated"),
-            *[dcc.Graph(id=f"plot-gen-{i}",  config=_GRAPH_CFG) for i in range(4)],
+            _row_label("Real"),
+            *[dcc.Graph(id=f"plot-real-{i}",  config=_GRAPH_CFG) for i in range(4)],
+            _row_label("Generated"),
+            *[dcc.Graph(id=f"plot-gen-{i}",   config=_GRAPH_CFG) for i in range(4)],
+            _row_label("Delta (current − previous)"),
+            *[dcc.Graph(id=f"plot-delta-{i}", config=_GRAPH_CFG) for i in range(4)],
         ],
         style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr",
                "gap": "4px", "padding": "4px"},
@@ -382,10 +416,12 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         return state
 
     @app.callback(
-        Output("plot-real-0", "figure"), Output("plot-real-1", "figure"),
-        Output("plot-real-2", "figure"), Output("plot-real-3", "figure"),
-        Output("plot-gen-0",  "figure"), Output("plot-gen-1",  "figure"),
-        Output("plot-gen-2",  "figure"), Output("plot-gen-3",  "figure"),
+        Output("plot-real-0",  "figure"), Output("plot-real-1",  "figure"),
+        Output("plot-real-2",  "figure"), Output("plot-real-3",  "figure"),
+        Output("plot-gen-0",   "figure"), Output("plot-gen-1",   "figure"),
+        Output("plot-gen-2",   "figure"), Output("plot-gen-3",   "figure"),
+        Output("plot-delta-0", "figure"), Output("plot-delta-1", "figure"),
+        Output("plot-delta-2", "figure"), Output("plot-delta-3", "figure"),
         Output("header-info", "children"),
         Output("step-slider", "max"), Output("step-slider", "value"),
         Input("state", "data"),
@@ -406,14 +442,22 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         real_t, cell_prims = load_step(real_files[real_idx])
         real_grid = renderers[real_dir].render_cell_smooth(cell_prims).numpy()
 
+        # Delta: current gen frame minus previous gen frame
+        if step_idx > 0:
+            _, prev_gen_grid, _ = load_gen_frame(gen_files[step_idx - 1])
+            delta = gen_grid - prev_gen_grid
+        else:
+            delta = np.zeros_like(gen_grid)
+
         frame_tag = "seed" if is_seed else "pred"
         n      = len(gen_files)
         header = (f"{run_names[run_idx]}   |   step {step_idx + 1}/{n}   |   "
                   f"t = {gen_t:.4g} ({frame_tag})   |   real t = {real_t:.4g}")
 
-        real_figs = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real") for i in range(4)]
-        gen_figs  = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}") for i in range(4)]
-        return (*real_figs, *gen_figs, header, n - 1, step_idx)
+        real_figs  = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real")       for i in range(4)]
+        gen_figs   = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}") for i in range(4)]
+        delta_figs = [make_delta_figure(delta[i],     f"Δ{FIELD_NAMES[i]}")             for i in range(4)]
+        return (*real_figs, *gen_figs, *delta_figs, header, n - 1, step_idx)
 
     return app
 

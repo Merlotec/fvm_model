@@ -213,8 +213,7 @@ class FVMLightningModel(L.LightningModule):
         window, target = batch
         pred = self(window)
         target_norm = (target - self.delta_mean) / self.delta_std
-        pred_norm   = (pred   - self.delta_mean) / self.delta_std
-        loss = self.criterion(pred_norm, target_norm)
+        loss = self.criterion(pred, target_norm)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
