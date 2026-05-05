@@ -133,7 +133,7 @@ def run_inference(
         state = {k.removeprefix('model.'): v for k, v in ckpt['state_dict'].items()}
     else:
         state = ckpt
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model.eval()
     c_print(f'Loaded checkpoint: {checkpoint}', color='green')
 
