@@ -32,6 +32,7 @@ Navigation
 ----------
     Click a run name on the left panel to switch runs.
     Use Prev / Next buttons or the slider to move between timesteps.
+    Use the "Show Δ / Show Values" toggle to switch between absolute values and deltas.
     Plotly figures support scroll-to-zoom and drag-to-pan.
 """
 
@@ -143,6 +144,15 @@ _HEATMAP_LAYOUT = dict(
     margin = dict(l=0, r=0, t=36, b=0),
     height = 280,
 )
+_ROW_LABEL_STYLE = {
+    "gridColumn": "1 / -1", "fontWeight": "600", "fontSize": "12px",
+    "padding": "4px 8px", "background": "#f0f0f0", "borderRadius": "3px",
+}
+_TOGGLE_STYLE = {
+    "fontSize": "12px", "padding": "4px 12px", "cursor": "pointer",
+    "marginLeft": "auto", "borderRadius": "4px", "border": "1px solid #aaa",
+    "background": "#fff",
+}
 
 
 def make_field_figure(grid: np.ndarray, title: str) -> go.Figure:
@@ -171,13 +181,6 @@ def make_delta_figure(delta: np.ndarray, title: str) -> go.Figure:
         **_HEATMAP_LAYOUT,
     )
     return fig
-
-
-def _row_label(text: str) -> html.Div:
-    return html.Div(text, style={
-        "gridColumn": "1 / -1", "fontWeight": "600", "fontSize": "12px",
-        "padding": "4px 8px", "background": "#f0f0f0", "borderRadius": "3px",
-    })
 
 
 def _sidebar(run_options: list[dict]) -> html.Div:
@@ -244,10 +247,8 @@ def build_app(root_dir: str) -> dash.Dash:
 
     plot_area = dcc.Loading(type="circle", color="#4a90d9", children=html.Div(
         [
-            _row_label("Fields"),
-            *[dcc.Graph(id=f"plot-{i}",  config=_GRAPH_CFG) for i in range(4)],
-            _row_label("Delta (current − previous)"),
-            *[dcc.Graph(id=f"delta-{i}", config=_GRAPH_CFG) for i in range(4)],
+            html.Div(id="row-label", children="Fields", style=_ROW_LABEL_STYLE),
+            *[dcc.Graph(id=f"plot-{i}", config=_GRAPH_CFG) for i in range(4)],
         ],
         style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr", "gap": "4px", "padding": "4px"},
     ))
@@ -256,6 +257,7 @@ def build_app(root_dir: str) -> dash.Dash:
         html.Div([
             html.Span("FVM Viewer", style={"fontWeight": "600", "fontSize": "16px", "marginRight": "20px"}),
             html.Span(id="header-info", style={"fontSize": "12px", "color": "#555", "fontFamily": "monospace"}),
+            html.Button("Show Δ (Delta)", id="view-toggle", n_clicks=0, style=_TOGGLE_STYLE),
         ], style={"padding": "8px 12px", "borderBottom": "1px solid #ddd", "display": "flex", "alignItems": "baseline"}),
         html.Div([
             _sidebar(opts),
@@ -263,11 +265,24 @@ def build_app(root_dir: str) -> dash.Dash:
                      style={"flex": "1", "overflow": "auto", "display": "flex", "flexDirection": "column"}),
         ], style={"display": "flex", "flex": "1", "overflow": "hidden"}),
         dcc.Store(id="state", data={"run_idx": 0, "step_idx": 0}),
+        dcc.Store(id="view-mode", data="absolute"),
         dcc.Store(id="_key-init", data=False),
         dcc.Interval(id="_key-interval", interval=300, max_intervals=1),
     ], style={"display": "flex", "flexDirection": "column", "height": "100vh", "fontFamily": "sans-serif"})
 
     _keyboard_js(app)
+
+    @app.callback(
+        Output("view-mode", "data"),
+        Output("view-toggle", "children"),
+        Input("view-toggle", "n_clicks"),
+        State("view-mode", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_view(_n, current_mode):
+        new_mode = "delta" if current_mode == "absolute" else "absolute"
+        label = "Show Values" if new_mode == "delta" else "Show Δ (Delta)"
+        return new_mode, label
 
     @app.callback(
         Output("state", "data"),
@@ -293,31 +308,37 @@ def build_app(root_dir: str) -> dash.Dash:
         return state
 
     @app.callback(
-        Output("plot-0",  "figure"), Output("plot-1",  "figure"),
-        Output("plot-2",  "figure"), Output("plot-3",  "figure"),
-        Output("delta-0", "figure"), Output("delta-1", "figure"),
-        Output("delta-2", "figure"), Output("delta-3", "figure"),
+        Output("plot-0", "figure"), Output("plot-1", "figure"),
+        Output("plot-2", "figure"), Output("plot-3", "figure"),
+        Output("row-label", "children"),
         Output("header-info", "children"),
         Output("step-slider", "max"), Output("step-slider", "value"),
         Input("state", "data"),
+        Input("view-mode", "data"),
     )
-    def render(state):
+    def render(state, view_mode):
         run_dir  = run_dirs[state["run_idx"]]
         step_idx = state["step_idx"]
         files    = all_files[run_dir]
         t, cell_prims = load_step(files[step_idx])
         grid = renderers[run_dir].render_cell_smooth(cell_prims).numpy()
-        if step_idx > 0:
-            _, prev_prims = load_step(files[step_idx - 1])
-            prev_grid = renderers[run_dir].render_cell_smooth(prev_prims).numpy()
-            delta = grid - prev_grid
+
+        if view_mode == "delta":
+            if step_idx > 0:
+                _, prev_prims = load_step(files[step_idx - 1])
+                prev_grid = renderers[run_dir].render_cell_smooth(prev_prims).numpy()
+                display = grid - prev_grid
+            else:
+                display = np.zeros_like(grid)
+            figs      = [make_delta_figure(display[i], f"Δ{FIELD_NAMES[i]}") for i in range(4)]
+            row_label = "Delta (current − previous)"
         else:
-            delta = np.zeros_like(grid)
-        n    = len(files)
+            figs      = [make_field_figure(grid[i], FIELD_NAMES[i]) for i in range(4)]
+            row_label = "Fields"
+
+        n      = len(files)
         header = f"{os.path.basename(run_dir)}   |   step {step_idx + 1}/{n}   |   t = {t:.4g}"
-        figs       = [make_field_figure(grid[i],  FIELD_NAMES[i])        for i in range(4)]
-        delta_figs = [make_delta_figure(delta[i], f"Δ{FIELD_NAMES[i]}")  for i in range(4)]
-        return (*figs, *delta_figs, header, n - 1, step_idx)
+        return (*figs, row_label, header, n - 1, step_idx)
 
     return app
 
@@ -332,6 +353,7 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     Only runs present in both directories are listed.
     The slider steps through the generated frames; the closest real frame is shown
     alongside each generated frame.
+    A toggle switches both rows between absolute values and deltas.
     """
     real_dirs = find_run_dirs(os.path.abspath(real_root))
     gen_dirs  = find_gen_run_dirs(os.path.abspath(gen_root))
@@ -347,7 +369,7 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
             f"  Gen:  {sorted(gen_by_name)}"
         )
 
-    run_names  = common_names
+    run_names     = common_names
     real_run_dirs = [real_by_name[n] for n in run_names]
     gen_run_dirs  = [gen_by_name[n]  for n in run_names]
 
@@ -361,15 +383,12 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     app  = dash.Dash(__name__, title="FVM Viewer — Compare")
     opts = [{"label": name, "value": i} for i, name in enumerate(run_names)]
 
-    # 12 plots: real (4) + generated (4) + delta (4)
     plot_area = dcc.Loading(type="circle", color="#4a90d9", children=html.Div(
         [
-            _row_label("Real"),
-            *[dcc.Graph(id=f"plot-real-{i}",  config=_GRAPH_CFG) for i in range(4)],
-            _row_label("Generated"),
-            *[dcc.Graph(id=f"plot-gen-{i}",   config=_GRAPH_CFG) for i in range(4)],
-            _row_label("Delta (current − previous)"),
-            *[dcc.Graph(id=f"plot-delta-{i}", config=_GRAPH_CFG) for i in range(4)],
+            html.Div(id="row-label-top", children="Real", style=_ROW_LABEL_STYLE),
+            *[dcc.Graph(id=f"plot-top-{i}", config=_GRAPH_CFG) for i in range(4)],
+            html.Div(id="row-label-bot", children="Generated", style=_ROW_LABEL_STYLE),
+            *[dcc.Graph(id=f"plot-bot-{i}", config=_GRAPH_CFG) for i in range(4)],
         ],
         style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr",
                "gap": "4px", "padding": "4px"},
@@ -379,6 +398,7 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         html.Div([
             html.Span("FVM Viewer — Compare", style={"fontWeight": "600", "fontSize": "16px", "marginRight": "20px"}),
             html.Span(id="header-info", style={"fontSize": "12px", "color": "#555", "fontFamily": "monospace"}),
+            html.Button("Show Δ (Delta)", id="view-toggle", n_clicks=0, style=_TOGGLE_STYLE),
         ], style={"padding": "8px 12px", "borderBottom": "1px solid #ddd", "display": "flex", "alignItems": "baseline"}),
         html.Div([
             _sidebar(opts),
@@ -386,11 +406,24 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
                      style={"flex": "1", "overflow": "auto", "display": "flex", "flexDirection": "column"}),
         ], style={"display": "flex", "flex": "1", "overflow": "hidden"}),
         dcc.Store(id="state", data={"run_idx": 0, "step_idx": 0}),
+        dcc.Store(id="view-mode", data="absolute"),
         dcc.Store(id="_key-init", data=False),
         dcc.Interval(id="_key-interval", interval=300, max_intervals=1),
     ], style={"display": "flex", "flexDirection": "column", "height": "100vh", "fontFamily": "sans-serif"})
 
     _keyboard_js(app)
+
+    @app.callback(
+        Output("view-mode", "data"),
+        Output("view-toggle", "children"),
+        Input("view-toggle", "n_clicks"),
+        State("view-mode", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_view(_n, current_mode):
+        new_mode = "delta" if current_mode == "absolute" else "absolute"
+        label = "Show Values" if new_mode == "delta" else "Show Δ (Delta)"
+        return new_mode, label
 
     @app.callback(
         Output("state", "data"),
@@ -416,17 +449,18 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         return state
 
     @app.callback(
-        Output("plot-real-0",  "figure"), Output("plot-real-1",  "figure"),
-        Output("plot-real-2",  "figure"), Output("plot-real-3",  "figure"),
-        Output("plot-gen-0",   "figure"), Output("plot-gen-1",   "figure"),
-        Output("plot-gen-2",   "figure"), Output("plot-gen-3",   "figure"),
-        Output("plot-delta-0", "figure"), Output("plot-delta-1", "figure"),
-        Output("plot-delta-2", "figure"), Output("plot-delta-3", "figure"),
+        Output("plot-top-0", "figure"), Output("plot-top-1", "figure"),
+        Output("plot-top-2", "figure"), Output("plot-top-3", "figure"),
+        Output("plot-bot-0", "figure"), Output("plot-bot-1", "figure"),
+        Output("plot-bot-2", "figure"), Output("plot-bot-3", "figure"),
+        Output("row-label-top", "children"),
+        Output("row-label-bot", "children"),
         Output("header-info", "children"),
         Output("step-slider", "max"), Output("step-slider", "value"),
         Input("state", "data"),
+        Input("view-mode", "data"),
     )
-    def render(state):
+    def render(state, view_mode):
         run_idx  = state["run_idx"]
         step_idx = state["step_idx"]
         real_dir = real_run_dirs[run_idx]
@@ -434,30 +468,38 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         gen_files  = gen_files_map[gen_dir]
         real_files = real_files_map[real_dir]
 
-        # Generated frame
         gen_t, gen_grid, is_seed = load_gen_frame(gen_files[step_idx])
-
-        # Closest real frame by timestamp
         real_idx  = closest_idx(real_files, gen_t)
         real_t, cell_prims = load_step(real_files[real_idx])
         real_grid = renderers[real_dir].render_cell_smooth(cell_prims).numpy()
-
-        # Delta: current gen frame minus previous gen frame
-        if step_idx > 0:
-            _, prev_gen_grid, _ = load_gen_frame(gen_files[step_idx - 1])
-            delta = gen_grid - prev_gen_grid
-        else:
-            delta = np.zeros_like(gen_grid)
 
         frame_tag = "seed" if is_seed else "pred"
         n      = len(gen_files)
         header = (f"{run_names[run_idx]}   |   step {step_idx + 1}/{n}   |   "
                   f"t = {gen_t:.4g} ({frame_tag})   |   real t = {real_t:.4g}")
 
-        real_figs  = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real")       for i in range(4)]
-        gen_figs   = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}") for i in range(4)]
-        delta_figs = [make_delta_figure(delta[i],     f"Δ{FIELD_NAMES[i]}")             for i in range(4)]
-        return (*real_figs, *gen_figs, *delta_figs, header, n - 1, step_idx)
+        if view_mode == "delta":
+            if step_idx > 0:
+                prev_gen_t, prev_gen_grid, _ = load_gen_frame(gen_files[step_idx - 1])
+                prev_real_idx = closest_idx(real_files, prev_gen_t)
+                _, prev_cell_prims = load_step(real_files[prev_real_idx])
+                prev_real_grid = renderers[real_dir].render_cell_smooth(prev_cell_prims).numpy()
+                real_delta = real_grid - prev_real_grid
+                gen_delta  = gen_grid  - prev_gen_grid
+            else:
+                real_delta = np.zeros_like(real_grid)
+                gen_delta  = np.zeros_like(gen_grid)
+            top_figs  = [make_delta_figure(real_delta[i], f"Δ{FIELD_NAMES[i]}  real")       for i in range(4)]
+            bot_figs  = [make_delta_figure(gen_delta[i],  f"Δ{FIELD_NAMES[i]}  {frame_tag}") for i in range(4)]
+            top_label = "Real Δ (current − previous)"
+            bot_label = "Generated Δ (current − previous)"
+        else:
+            top_figs  = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real")       for i in range(4)]
+            bot_figs  = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}") for i in range(4)]
+            top_label = "Real"
+            bot_label = "Generated"
+
+        return (*top_figs, *bot_figs, top_label, bot_label, header, n - 1, step_idx)
 
     return app
 

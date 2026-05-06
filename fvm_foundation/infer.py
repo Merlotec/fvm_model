@@ -133,19 +133,33 @@ def run_inference(
         state = {k.removeprefix('model.'): v for k, v in ckpt['state_dict'].items()}
     else:
         state = ckpt
-    model.load_state_dict(state, strict=False)
+
+    # Extract delta normalisation buffers saved on the Lightning module before
+    # loading into FluidVisionModel (which doesn't have these buffers itself).
+    ckpt_delta_mean = state.pop('delta_mean', None)
+    ckpt_delta_std  = state.pop('delta_std',  None)
+
+    result = model.load_state_dict(state, strict=False)
+    if result.missing_keys:
+        c_print(f'Warning: checkpoint is missing keys: {result.missing_keys}', color='yellow')
+    if result.unexpected_keys:
+        c_print(f'Warning: unexpected keys in checkpoint (not loaded): {result.unexpected_keys}', color='yellow')
     model.eval()
     c_print(f'Loaded checkpoint: {checkpoint}', color='green')
 
     delta_mean = delta_std = None
-    if _DELTA_STATS_PATH.exists():
+    if ckpt_delta_mean is not None and ckpt_delta_std is not None:
+        delta_mean = ckpt_delta_mean.to(device).view(-1, 1, 1)
+        delta_std  = ckpt_delta_std.to(device).view(-1, 1, 1)
+        c_print('Loaded delta normalisation stats from checkpoint', color='green')
+    elif _DELTA_STATS_PATH.exists():
         with open(_DELTA_STATS_PATH) as _f:
             _stats = json.load(_f)
         delta_mean = torch.tensor(_stats['mean'], device=device).view(-1, 1, 1)
         delta_std  = torch.tensor(_stats['std'],  device=device).view(-1, 1, 1)
-        c_print('Loaded delta normalisation stats', color='green')
+        c_print('Loaded delta normalisation stats from delta_stats.json (fallback)', color='yellow')
     else:
-        c_print('Warning: delta_stats.json not found — predictions will not be denormalised', color='yellow')
+        c_print('Warning: no delta normalisation stats found — predictions will not be denormalised', color='yellow')
 
     # ---- input files ----
     all_files = _find_timestep_files(sim_dir)

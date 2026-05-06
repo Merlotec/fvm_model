@@ -13,7 +13,7 @@ class FluidDecoder(nn.Module):
         self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
         self.up4 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)        
 
-        self.final_proj = nn.Conv2d(32, out_channels, kernel_size=3, padding=1)
+        self.final_proj = nn.Conv2d(32, out_channels, kernel_size=3, padding=1, padding_mode='reflect')
 
     def forward(self, x):
                 
@@ -26,10 +26,10 @@ class FluidDecoder(nn.Module):
         x = x.unflatten(2, (grid, grid))
         
         # Use relu activation between upsampling steps to learn non linear fluid boundaries.
-        x = F.relu(self.up1(x))
-        x = F.relu(self.up2(x))
-        x = F.relu(self.up3(x))
-        x = F.relu(self.up4(x))
+        x = F.gelu(self.up1(x))
+        x = F.gelu(self.up2(x))
+        x = F.gelu(self.up3(x))
+        x = F.gelu(self.up4(x))
         
         # No activation function here, as fluid variables (velocity) can be negative.
         # [batch, 3, 224, 224]
