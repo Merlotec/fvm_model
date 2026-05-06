@@ -13,10 +13,10 @@ class FluidDecoder(nn.Module):
         self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
         self.up4 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)        
 
-        self.final_proj = nn.Conv2d(32, out_channels, kernel_size=3, padding=1, padding_mode='reflect')
+        self.final_proj = nn.Conv2d(32, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x):
-                
+
         # [batch, 768, 196]
         x = x.transpose(1, 2)
 
@@ -24,12 +24,12 @@ class FluidDecoder(nn.Module):
         n = x.shape[2]
         grid = int(n ** 0.5)
         x = x.unflatten(2, (grid, grid))
-        
-        # Use relu activation between upsampling steps to learn non linear fluid boundaries.
-        x = F.gelu(self.up1(x))
-        x = F.gelu(self.up2(x))
-        x = F.gelu(self.up3(x))
-        x = F.gelu(self.up4(x))
+
+        # ELU allows negative intermediate features, which is necessary for delta prediction.
+        x = F.elu(self.up1(x))
+        x = F.elu(self.up2(x))
+        x = F.elu(self.up3(x))
+        x = F.elu(self.up4(x))
         
         # No activation function here, as fluid variables (velocity) can be negative.
         # [batch, 3, 224, 224]
