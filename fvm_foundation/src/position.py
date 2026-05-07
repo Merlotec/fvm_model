@@ -76,10 +76,13 @@ class RotaryEmbedding2D(nn.Module):
         """
         g = self.grid_size
         N = q.shape[2]
-        assert N == g * g, f"seq_len {N} != grid_size^2 {g*g}"
+        assert N % (g * g) == 0, f"seq_len {N} must be divisible by grid_size^2 {g*g}"
+        num_frames = N // (g * g)
 
-        rows = torch.arange(g, device=q.device).repeat_interleave(g)  # (N,)
-        cols = torch.arange(g, device=q.device).repeat(g)             # (N,)
+        # Tile spatial positions across the temporal dimension — each frame shares
+        # the same 2D layout; temporal position is carried by the learned embedding.
+        rows = torch.arange(g, device=q.device).repeat_interleave(g).repeat(num_frames)
+        cols = torch.arange(g, device=q.device).repeat(g).repeat(num_frames)
 
         # (N, head_dim): row RoPE for first half, col RoPE for second half
         cos = torch.cat([self.cos_cache[rows], self.cos_cache[cols]], dim=-1)
