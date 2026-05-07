@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from patch import StackingPatchEmbedding
 from transformer import FluidVisionTransformer
-from decoder import FluidDecoder
+from linear_decoder import LinearDecoder
 
 
 class FluidVisionModel(nn.Module):
@@ -12,9 +12,9 @@ class FluidVisionModel(nn.Module):
         grid_size = int(math.isqrt(num_patches))
         assert grid_size * grid_size == num_patches, "num_patches must be a perfect square"
 
-        self.patch_embed       = StackingPatchEmbedding(num_obs, num_channels, patch_size, emb_dim)
+        self.patch_embed        = StackingPatchEmbedding(num_obs, num_channels, patch_size, emb_dim)
         self.vision_transformer = FluidVisionTransformer(emb_dim, grid_size=grid_size)
-        self.decoder           = FluidDecoder(emb_dim, num_channels)
+        self.decoder            = LinearDecoder(emb_dim, num_channels, patch_size, grid_size)
 
     def forward(self, x):
         x = self.patch_embed(x)
