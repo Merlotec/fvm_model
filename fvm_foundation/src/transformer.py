@@ -41,6 +41,7 @@ class RoPETransformerEncoderLayer(nn.Module):
         grid_size:       int,
         dim_feedforward: int   = 3072,
         dropout:         float = 0.1,
+        num_layers:      int   = 12,
     ):
         super().__init__()
         self.attn  = RoPEAttention(emb_dim, nhead, grid_size, dropout)
@@ -53,6 +54,12 @@ class RoPETransformerEncoderLayer(nn.Module):
         )
         self.norm1 = nn.LayerNorm(emb_dim)
         self.norm2 = nn.LayerNorm(emb_dim)
+
+        # Scale down residual branch outputs so the residual stream variance
+        # stays ~constant across depth (GPT-2 / ViT-style depth scaling).
+        scale = (2 * num_layers) ** -0.5
+        nn.init.normal_(self.attn.out_proj.weight, std=scale * (emb_dim ** -0.5))
+        nn.init.normal_(self.ff[3].weight,         std=scale * (dim_feedforward ** -0.5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
@@ -70,7 +77,7 @@ class FluidVisionTransformer(nn.Module):
     ):
         super().__init__()
         self.layers = nn.ModuleList([
-            RoPETransformerEncoderLayer(emb_dim, nhead, grid_size)
+            RoPETransformerEncoderLayer(emb_dim, nhead, grid_size, num_layers=num_layers)
             for _ in range(num_layers)
         ])
 

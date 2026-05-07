@@ -89,7 +89,7 @@ def _load_and_render(path: Path, renderer: MeshRenderer) -> torch.Tensor:
     """Load a raw timestep file and return a rendered (N_CHANNELS, H, W) tensor."""
     d      = np.load(path)
     values = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
-    return renderer.render_cell_smooth(values)   # (N_CHANNELS, H, W)
+    return renderer.render_cell_smooth(values).nan_to_num(0.0)   # (N_CHANNELS, H, W)
 
 
 def _t_of(path: Path) -> float:
@@ -134,10 +134,12 @@ def run_inference(
     else:
         state = ckpt
 
-    # Extract delta normalisation buffers saved on the Lightning module before
+    # Extract normalisation buffers saved on the Lightning module before
     # loading into FluidVisionModel (which doesn't have these buffers itself).
     ckpt_delta_mean = state.pop('delta_mean', None)
     ckpt_delta_std  = state.pop('delta_std',  None)
+    ckpt_input_mean = state.pop('input_mean', None)
+    ckpt_input_std  = state.pop('input_std',  None)
 
     result = model.load_state_dict(state, strict=False)
     if result.missing_keys:
@@ -147,19 +149,25 @@ def run_inference(
     model.eval()
     c_print(f'Loaded checkpoint: {checkpoint}', color='green')
 
-    delta_mean = delta_std = None
-    if ckpt_delta_mean is not None and ckpt_delta_std is not None:
-        delta_mean = ckpt_delta_mean.to(device).view(-1, 1, 1)
-        delta_std  = ckpt_delta_std.to(device).view(-1, 1, 1)
-        c_print('Loaded delta normalisation stats from checkpoint', color='green')
-    elif _DELTA_STATS_PATH.exists():
-        with open(_DELTA_STATS_PATH) as _f:
-            _stats = json.load(_f)
-        delta_mean = torch.tensor(_stats['mean'], device=device).view(-1, 1, 1)
-        delta_std  = torch.tensor(_stats['std'],  device=device).view(-1, 1, 1)
-        c_print('Loaded delta normalisation stats from delta_stats.json (fallback)', color='yellow')
-    else:
-        c_print('Warning: no delta normalisation stats found — predictions will not be denormalised', color='yellow')
+    _INPUT_STATS_PATH = Path(__file__).resolve().parent / 'input_stats.json'
+
+    def _load_pair(ckpt_m, ckpt_s, json_path, label):
+        if ckpt_m is not None and ckpt_s is not None:
+            c_print(f'Loaded {label} from checkpoint', color='green')
+            return ckpt_m.to(device).view(-1, 1, 1), ckpt_s.to(device).view(-1, 1, 1)
+        if json_path.exists():
+            with open(json_path) as _f:
+                s = json.load(_f)
+            c_print(f'Loaded {label} from {json_path.name} (fallback)', color='yellow')
+            return (torch.tensor(s['mean'], device=device).view(-1, 1, 1),
+                    torch.tensor(s['std'],  device=device).view(-1, 1, 1))
+        c_print(f'Warning: no {label} found — using identity', color='yellow')
+        return None, None
+
+    delta_mean, delta_std = _load_pair(ckpt_delta_mean, ckpt_delta_std,
+                                       _DELTA_STATS_PATH, 'delta normalisation')
+    input_mean, input_std = _load_pair(ckpt_input_mean, ckpt_input_std,
+                                       _INPUT_STATS_PATH, 'input normalisation')
 
     # ---- input files ----
     all_files = _find_timestep_files(sim_dir)
@@ -195,10 +203,20 @@ def run_inference(
 
     # ---- autoregressive rollout ----
     c_print('Running inference...', color='yellow')
+    def _normalise_window(frames):
+        """Stack frames into model input, normalise per-channel, zero background."""
+        inp = torch.cat(frames, dim=0).unsqueeze(0)   # (1, W*C, H, W)
+        if input_mean is not None and input_std is not None:
+            nm = input_mean.repeat(WINDOW_SIZE, 1, 1).unsqueeze(0)
+            ns = input_std.repeat( WINDOW_SIZE, 1, 1).unsqueeze(0)
+            inp = ((inp - nm) / ns).nan_to_num(0.0)
+        else:
+            inp = inp.nan_to_num(0.0)
+        return inp
+
     with torch.no_grad():
         for step in range(n_steps):
-            # Stack window into (1, WINDOW_SIZE * N_CHANNELS, H, W)
-            inp = torch.cat(window, dim=0).unsqueeze(0)   # (1, W*C, H, W)
+            inp = _normalise_window(window)
 
             raw_delta = model(inp).squeeze(0)             # (N_CHANNELS, H, W)
             delta = raw_delta * delta_std + delta_mean if delta_mean is not None else raw_delta

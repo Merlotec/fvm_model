@@ -34,6 +34,7 @@ N_CHANNELS  = _HP['n_channels']
 WINDOW_SIZE = _HP['window_size']
 
 DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
+INPUT_STATS_PATH = Path(__file__).resolve().parent / 'input_stats.json'
 
 
 def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) -> MeshRenderer:
@@ -88,8 +89,44 @@ def _compute_delta_stats(sim_dirs: list[Path], renderer, n_samples: int = 200):
         deltas.append(_render(path_b) - _render(path_a))
 
     deltas = torch.stack(deltas)          # (n, C, H, W)
-    mean = deltas.mean(dim=(0, 2, 3))     # (C,)
-    std  = deltas.std(dim=(0, 2, 3)).clamp(min=1e-6)
+    # nan-safe stats — renderer may fill background pixels with NaN
+    mask   = torch.isfinite(deltas)
+    safe   = deltas.nan_to_num(0.0)
+    count  = mask.sum(dim=(0, 2, 3)).float()
+    mean   = (safe * mask).sum(dim=(0, 2, 3)) / count
+    var    = ((safe - mean.view(1, -1, 1, 1)) ** 2 * mask).sum(dim=(0, 2, 3)) / count
+    std    = var.sqrt().clamp(min=1e-6)
+    return mean, std
+
+
+def _compute_input_stats(sim_dirs: list[Path], renderer, n_samples: int = 200):
+    """Sample individual frames to estimate per-channel input mean and std."""
+    all_files = []
+    for d in sim_dirs:
+        all_files.extend(sorted(
+            [f for f in d.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')]
+        ))
+
+    n       = min(n_samples, len(all_files))
+    indices = torch.randperm(len(all_files))[:n].tolist()
+
+    sum1  = torch.zeros(N_CHANNELS)
+    sum2  = torch.zeros(N_CHANNELS)
+    count = torch.zeros(N_CHANNELS)
+
+    for i in indices:
+        d    = np.load(all_files[i])
+        vals = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
+        rendered = renderer.render_cell_smooth(vals)   # (C, H, W)
+        for c in range(N_CHANNELS):
+            pixels = rendered[c]
+            finite = pixels[torch.isfinite(pixels)]
+            sum1[c]  += finite.sum()
+            sum2[c]  += (finite ** 2).sum()
+            count[c] += finite.numel()
+
+    mean = sum1 / count
+    std  = ((sum2 / count) - mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
     return mean, std
 
 
@@ -102,12 +139,14 @@ class RenderedFVMDataset(Dataset):
         target : (N_channels, H, W)
     """
 
-    def __init__(self, sim_dir: Path, renderer: MeshRenderer, window_size: int):
+    def __init__(self, sim_dir: Path, renderer: MeshRenderer, window_size: int,
+                 skip_initial: int = 20):
         files = sorted(
             [f for f in os.listdir(sim_dir) if f.startswith('t_') and f.endswith('.npz')],
             key=lambda f: float(f[2:-4]),
         )
-        self.paths       = [sim_dir / f for f in files]
+        # Drop early transient frames — deltas are 10-100× larger than settled state
+        self.paths       = [sim_dir / f for f in files][skip_initial:]
         self.renderer    = renderer
         self.window_size = window_size
 
@@ -115,12 +154,10 @@ class RenderedFVMDataset(Dataset):
         return max(0, len(self.paths) - self.window_size)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        window = torch.cat(
-            [self._render(self.paths[idx + i]) for i in range(self.window_size)],
-            dim=0,
-        )
-        target    = self._render(self.paths[idx + self.window_size])
-        last_frame = window[-N_CHANNELS:]   # last frame already in window
+        frames = [self._render(self.paths[idx + i]) for i in range(self.window_size)]
+        window     = torch.cat(frames, dim=0)   # (W*C, H, W) — NaN for background
+        target     = self._render(self.paths[idx + self.window_size])
+        last_frame = frames[-1]
         return window, target - last_frame
 
     def _render(self, path: Path) -> torch.Tensor:
@@ -133,16 +170,18 @@ class RenderedFVMDataset(Dataset):
 class FVMDataModule(L.LightningDataModule):
     def __init__(
         self,
-        data_dir:    Path,
-        window_size: int  = WINDOW_SIZE,
-        batch_size:  int  = 4,
-        num_workers: int  = 4,
+        data_dir:     Path,
+        window_size:  int = WINDOW_SIZE,
+        batch_size:   int = 4,
+        num_workers:  int = 4,
+        skip_initial: int = 20,
     ):
         super().__init__()
-        self.data_dir    = Path(data_dir)
-        self.window_size = window_size
-        self.batch_size  = batch_size
-        self.num_workers = num_workers
+        self.data_dir     = Path(data_dir)
+        self.window_size  = window_size
+        self.batch_size   = batch_size
+        self.num_workers  = num_workers
+        self.skip_initial = skip_initial
         self._renderer: MeshRenderer | None = None
 
     def setup(self, stage: str | None = None):
@@ -152,7 +191,8 @@ class FVMDataModule(L.LightningDataModule):
         c_print('Scanning simulation directories...', color='yellow')
         subdirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
         datasets = [
-            RenderedFVMDataset(d, self._renderer, self.window_size)
+            RenderedFVMDataset(d, self._renderer, self.window_size,
+                               skip_initial=self.skip_initial)
             for d in subdirs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]
@@ -166,6 +206,12 @@ class FVMDataModule(L.LightningDataModule):
         with open(DELTA_STATS_PATH, 'w') as f:
             json.dump({'mean': mean.tolist(), 'std': std.tolist()}, f)
         c_print(f'Delta stats saved — mean={[f"{v:.4f}" for v in mean.tolist()]}  std={[f"{v:.4f}" for v in std.tolist()]}', color='green')
+
+        c_print('Computing input statistics (sampling frames)...', color='yellow')
+        inp_mean, inp_std = _compute_input_stats(subdirs, self._renderer)
+        with open(INPUT_STATS_PATH, 'w') as f:
+            json.dump({'mean': inp_mean.tolist(), 'std': inp_std.tolist()}, f)
+        c_print(f'Input stats saved — mean={[f"{v:.4f}" for v in inp_mean.tolist()]}  std={[f"{v:.4f}" for v in inp_std.tolist()]}', color='green')
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -192,28 +238,41 @@ class FVMLightningModel(L.LightningModule):
             emb_dim      = EMB_DIM,
             num_channels = N_CHANNELS,
         )
-        self.criterion = nn.L1Loss()
         self.register_buffer('delta_mean', torch.zeros(N_CHANNELS, 1, 1))
-        self.register_buffer('delta_std',  torch.ones(N_CHANNELS, 1, 1))
+        self.register_buffer('delta_std',  torch.ones( N_CHANNELS, 1, 1))
+        self.register_buffer('input_mean', torch.zeros(N_CHANNELS, 1, 1))
+        self.register_buffer('input_std',  torch.ones( N_CHANNELS, 1, 1))
+
+    def _normalise_window(self, window: torch.Tensor) -> torch.Tensor:
+        """Normalise input per channel then zero background (NaN) pixels."""
+        # window: (B, W*C, H, W) — each frame block has N_CHANNELS channels
+        nm = self.input_mean.repeat(WINDOW_SIZE, 1, 1).unsqueeze(0)  # (1, W*C, 1, 1)
+        ns = self.input_std.repeat( WINDOW_SIZE, 1, 1).unsqueeze(0)
+        return ((window - nm) / ns).nan_to_num(0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+        return self.model(self._normalise_window(x))
 
     def on_fit_start(self) -> None:
-        if DELTA_STATS_PATH.exists():
-            with open(DELTA_STATS_PATH) as f:
-                stats = json.load(f)
-            self.delta_mean.copy_(torch.tensor(stats['mean'], device=self.device).view(N_CHANNELS, 1, 1))
-            self.delta_std.copy_(torch.tensor(stats['std'],  device=self.device).view(N_CHANNELS, 1, 1))
-            c_print('Loaded delta normalisation stats', color='green')
-        else:
-            c_print('Warning: delta_stats.json not found — training without delta normalisation', color='yellow')
+        def _load(path, mean_buf, std_buf, label):
+            if path.exists():
+                with open(path) as f:
+                    s = json.load(f)
+                mean_buf.copy_(torch.tensor(s['mean'], device=self.device).view(N_CHANNELS, 1, 1))
+                std_buf.copy_( torch.tensor(s['std'],  device=self.device).view(N_CHANNELS, 1, 1))
+                c_print(f'Loaded {label}', color='green')
+            else:
+                c_print(f'Warning: {path.name} not found', color='yellow')
+
+        _load(DELTA_STATS_PATH, self.delta_mean, self.delta_std, 'delta normalisation stats')
+        _load(INPUT_STATS_PATH, self.input_mean, self.input_std, 'input normalisation stats')
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         window, target = batch
-        pred = self(window)
+        pred        = self(window)
         target_norm = (target - self.delta_mean) / self.delta_std
-        loss = self.criterion(pred, target_norm)
+        valid       = torch.isfinite(target_norm)  # False for background pixels outside the mesh
+        loss        = (pred - target_norm).abs()[valid].mean()
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
@@ -262,7 +321,7 @@ def main():
         max_epochs    = args.epochs,
         devices       = args.devices,
         num_nodes     = args.num_nodes,
-        strategy      = 'ddp' if (args.devices != 1 or args.num_nodes > 1) else 'auto',
+        strategy      = 'ddp' if (torch.cuda.is_available() and (args.devices != 1 or args.num_nodes > 1)) else 'auto',
         precision     = args.precision,
         callbacks     = [checkpoint_cb],
         log_every_n_steps = 10,
