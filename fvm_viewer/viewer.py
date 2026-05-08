@@ -155,9 +155,11 @@ _TOGGLE_STYLE = {
 }
 
 
-def make_field_figure(grid: np.ndarray, title: str) -> go.Figure:
+def make_field_figure(grid: np.ndarray, title: str,
+                      zmin: float | None = None, zmax: float | None = None) -> go.Figure:
     fig = go.Figure(go.Heatmap(
         z=grid, colorscale="Viridis", showscale=True,
+        zmin=zmin, zmax=zmax,
         colorbar=dict(thickness=10, len=0.85),
     ))
     fig.update_layout(
@@ -168,8 +170,9 @@ def make_field_figure(grid: np.ndarray, title: str) -> go.Figure:
     return fig
 
 
-def make_delta_figure(delta: np.ndarray, title: str) -> go.Figure:
-    maxabs = float(np.abs(delta).max()) or 1.0
+def make_delta_figure(delta: np.ndarray, title: str, maxabs: float | None = None) -> go.Figure:
+    if maxabs is None:
+        maxabs = float(np.abs(delta).max()) or 1.0
     fig = go.Figure(go.Heatmap(
         z=delta, colorscale="RdBu_r", showscale=True,
         zmid=0, zmin=-maxabs, zmax=maxabs,
@@ -489,13 +492,19 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
             else:
                 real_delta = np.zeros_like(real_grid)
                 gen_delta  = np.zeros_like(gen_grid)
-            top_figs  = [make_delta_figure(real_delta[i], f"Δ{FIELD_NAMES[i]}  real")       for i in range(4)]
-            bot_figs  = [make_delta_figure(gen_delta[i],  f"Δ{FIELD_NAMES[i]}  {frame_tag}") for i in range(4)]
+            shared_maxabs = [
+                float(max(np.abs(real_delta[i]).max(), np.abs(gen_delta[i]).max())) or 1.0
+                for i in range(4)
+            ]
+            top_figs  = [make_delta_figure(real_delta[i], f"Δ{FIELD_NAMES[i]}  real",       shared_maxabs[i]) for i in range(4)]
+            bot_figs  = [make_delta_figure(gen_delta[i],  f"Δ{FIELD_NAMES[i]}  {frame_tag}", shared_maxabs[i]) for i in range(4)]
             top_label = "Real Δ (current − previous)"
             bot_label = "Generated Δ (current − previous)"
         else:
-            top_figs  = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real")       for i in range(4)]
-            bot_figs  = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}") for i in range(4)]
+            shared_zmin = [float(min(real_grid[i].min(), gen_grid[i].min())) for i in range(4)]
+            shared_zmax = [float(max(real_grid[i].max(), gen_grid[i].max())) for i in range(4)]
+            top_figs  = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real",       shared_zmin[i], shared_zmax[i]) for i in range(4)]
+            bot_figs  = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}", shared_zmin[i], shared_zmax[i]) for i in range(4)]
             top_label = "Real"
             bot_label = "Generated"
 

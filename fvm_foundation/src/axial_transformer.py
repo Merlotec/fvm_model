@@ -21,11 +21,10 @@ import torch.nn.functional as F
 
 def _build_rope_buffers(seq_len: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (cos, sin) each of shape (seq_len, head_dim)."""
-    half = head_dim // 2
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, half, 2).float() / half))
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
     pos   = torch.arange(seq_len, dtype=torch.float32)
-    freqs = torch.outer(pos, inv_freq)          # (seq_len, half/2)
-    emb   = torch.cat([freqs, freqs], dim=-1)   # (seq_len, half)
+    freqs = torch.outer(pos, inv_freq)          # (seq_len, head_dim//2)
+    emb   = torch.cat([freqs, freqs], dim=-1)   # (seq_len, head_dim)
     return emb.cos(), emb.sin()
 
 
