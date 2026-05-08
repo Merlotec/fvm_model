@@ -36,6 +36,7 @@ NUM_LAYERS  = _HP['num_layers']
 
 DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
 INPUT_STATS_PATH = Path(__file__).resolve().parent / 'input_stats.json'
+PIXEL_MASK_PATH  = Path(__file__).resolve().parent / 'pixel_mask.pt'
 
 
 def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) -> MeshRenderer:
@@ -131,6 +132,14 @@ def _compute_input_stats(sim_dirs: list[Path], renderer, n_samples: int = 200):
     return mean, std
 
 
+def build_pixel_mask(renderer, resolution: tuple[int, int]) -> torch.Tensor:
+    """Boolean (1, 1, H, W) mask — True for pixels inside the fluid mesh, False elsewhere."""
+    H, W = resolution
+    mask = torch.zeros(H * W, dtype=torch.bool)
+    mask[renderer._interior_idx] = True
+    return mask.view(1, 1, H, W)
+
+
 class RenderedFVMDataset(Dataset):
     """
     Rolling-window samples from one simulation run, rendered to pixel grids.
@@ -202,6 +211,10 @@ class FVMDataModule(L.LightningDataModule):
         self._dataset = ConcatDataset(datasets)
         c_print(f'Dataset: {len(self._dataset)} samples across {len(datasets)} runs', color='bright_green')
 
+        pixel_mask = build_pixel_mask(self._renderer, RESOLUTION)
+        torch.save(pixel_mask, PIXEL_MASK_PATH)
+        c_print(f'Pixel mask saved — {pixel_mask.sum().item()} fluid pixels of {pixel_mask.numel()}', color='green')
+
         c_print('Computing delta statistics (sampling 200 frame pairs)...', color='yellow')
         mean, std = _compute_delta_stats(subdirs, self._renderer)
         with open(DELTA_STATS_PATH, 'w') as f:
@@ -240,10 +253,12 @@ class FVMLightningModel(L.LightningModule):
             num_channels = N_CHANNELS,
             num_layers   = NUM_LAYERS,
         )
-        self.register_buffer('delta_mean', torch.zeros(N_CHANNELS, 1, 1))
-        self.register_buffer('delta_std',  torch.ones( N_CHANNELS, 1, 1))
-        self.register_buffer('input_mean', torch.zeros(N_CHANNELS, 1, 1))
-        self.register_buffer('input_std',  torch.ones( N_CHANNELS, 1, 1))
+        H, W = RESOLUTION
+        self.register_buffer('delta_mean',  torch.zeros(N_CHANNELS, 1, 1))
+        self.register_buffer('delta_std',   torch.ones( N_CHANNELS, 1, 1))
+        self.register_buffer('input_mean',  torch.zeros(N_CHANNELS, 1, 1))
+        self.register_buffer('input_std',   torch.ones( N_CHANNELS, 1, 1))
+        self.register_buffer('pixel_mask',  torch.ones(1, 1, H, W, dtype=torch.bool))
 
     def _normalise_window(self, window: torch.Tensor) -> torch.Tensor:
         """Normalise input per channel then zero background (NaN) pixels."""
@@ -253,7 +268,8 @@ class FVMLightningModel(L.LightningModule):
         return ((window - nm) / ns).nan_to_num(0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(self._normalise_window(x))
+        pred = self.model(self._normalise_window(x))
+        return pred * self.pixel_mask  # zero boundary/background pixels
 
     def on_fit_start(self) -> None:
         def _load(path, mean_buf, std_buf, label):
@@ -269,11 +285,17 @@ class FVMLightningModel(L.LightningModule):
         _load(DELTA_STATS_PATH, self.delta_mean, self.delta_std, 'delta normalisation stats')
         _load(INPUT_STATS_PATH, self.input_mean, self.input_std, 'input normalisation stats')
 
+        if PIXEL_MASK_PATH.exists():
+            self.pixel_mask.copy_(torch.load(PIXEL_MASK_PATH, map_location=self.device))
+            c_print('Loaded pixel mask', color='green')
+        else:
+            c_print('Warning: pixel_mask.pt not found — all pixels treated as fluid', color='yellow')
+
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         window, target = batch
         pred        = self(window)
         target_norm = (target - self.delta_mean) / self.delta_std
-        valid       = torch.isfinite(target_norm)  # False for background pixels outside the mesh
+        valid       = self.pixel_mask.expand_as(target_norm)  # fluid-only pixels
         err  = (pred - target_norm)[valid]
         loss = err.pow(2).mean() + err.abs().mean()
 
