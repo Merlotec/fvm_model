@@ -1,8 +1,8 @@
 import math
 import torch.nn as nn
 
-from stacking_patch import StackingPatchEmbedding
-from transformer import FluidVisionTransformer
+from temporal_patch import TemporalPatchEmbedding
+from axial_transformer import FluidAxialTransformer
 from linear_overflow_decoder import LinearOverflowDecoder
 
 
@@ -12,13 +12,14 @@ class FluidVisionModel(nn.Module):
         grid_size = int(math.isqrt(num_patches))
         assert grid_size * grid_size == num_patches, "num_patches must be a perfect square"
 
-        self.num_patches        = num_patches   # per frame, needed to slice decoder input
-        self.patch_embed        = StackingPatchEmbedding(num_obs, num_channels, patch_size, emb_dim)
-        self.vision_transformer = FluidVisionTransformer(emb_dim, grid_size=grid_size)
-        self.decoder            = LinearOverflowDecoder(emb_dim, num_channels, patch_size, grid_size)
+        self.num_patches = num_patches
+        self.patch_embed = TemporalPatchEmbedding(num_obs, num_channels, patch_size, emb_dim)
+        self.transformer = FluidAxialTransformer(emb_dim, grid_size=grid_size, num_obs=num_obs)
+        self.decoder     = LinearOverflowDecoder(emb_dim, num_channels, patch_size, grid_size)
 
     def forward(self, x):
-        x = self.patch_embed(x)          # (B, num_patches, emb_dim)
-        x = self.vision_transformer(x)   # (B, num_patches, emb_dim)
-        x = self.decoder(x)              # (B, num_channels, H, W)
+        x = self.patch_embed(x)               # (B, T*num_patches, emb_dim)
+        x = self.transformer(x)               # (B, T*num_patches, emb_dim)
+        x = x[:, -self.num_patches:, :]       # last frame's tokens (B, num_patches, emb_dim)
+        x = self.decoder(x)                   # (B, num_channels, H, W)
         return x
