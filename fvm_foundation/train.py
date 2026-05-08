@@ -32,6 +32,7 @@ PATCH_SIZE  = _HP['patch_size']
 EMB_DIM     = _HP['emb_dim']
 N_CHANNELS  = _HP['n_channels']
 WINDOW_SIZE = _HP['window_size']
+NUM_LAYERS  = _HP['num_layers']
 
 DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
 INPUT_STATS_PATH = Path(__file__).resolve().parent / 'input_stats.json'
@@ -237,6 +238,7 @@ class FVMLightningModel(L.LightningModule):
             patch_size   = PATCH_SIZE,
             emb_dim      = EMB_DIM,
             num_channels = N_CHANNELS,
+            num_layers   = NUM_LAYERS,
         )
         self.register_buffer('delta_mean', torch.zeros(N_CHANNELS, 1, 1))
         self.register_buffer('delta_std',  torch.ones( N_CHANNELS, 1, 1))
@@ -272,8 +274,15 @@ class FVMLightningModel(L.LightningModule):
         pred        = self(window)
         target_norm = (target - self.delta_mean) / self.delta_std
         valid       = torch.isfinite(target_norm)  # False for background pixels outside the mesh
-        loss        = (pred - target_norm).abs()[valid].mean()
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        err  = (pred - target_norm)[valid]
+        loss = err.pow(2).mean() + err.abs().mean()
+
+        pred_denorm = pred * self.delta_std + self.delta_mean
+        rel_err = ((target - pred_denorm).abs()[valid] /
+                   target.abs()[valid].clamp(min=1e-6)).mean()
+
+        self.log('train_loss', loss,    on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('rel_err',    rel_err, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):

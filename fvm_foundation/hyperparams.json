@@ -10,5 +10,6 @@
     "num_workers": 4,
     "devices": -1,
     "num_nodes": 1,
-    "precision": "32"
+    "precision": "32",
+    "num_layers": 6
 }
