@@ -140,6 +140,26 @@ def build_pixel_mask(renderer, resolution: tuple[int, int]) -> torch.Tensor:
     return mask.view(1, 1, H, W)
 
 
+def _print_histogram(values: torch.Tensor, title: str, bins: int = 25, width: int = 50) -> None:
+    n = values.numel()
+    if n == 0:
+        return
+    v = values.float().cpu()
+    lo  = torch.quantile(v, 0.01).item()
+    hi  = torch.quantile(v, 0.99).item()
+    if lo >= hi:
+        hi = lo + 1e-6
+    counts = torch.histc(v, bins=bins, min=lo, max=hi)
+    edges  = torch.linspace(lo, hi, bins + 1).tolist()
+    peak   = counts.max().item()
+    print(f'\n{title}  n={n:,}  mean={v.mean():.4f}  std={v.std():.4f}  '
+          f'p1={lo:.4f}  p99={hi:.4f}')
+    for i in range(bins):
+        bar = '█' * int(counts[i].item() / peak * width if peak > 0 else 0)
+        print(f'  [{edges[i]:+8.4f}, {edges[i+1]:+8.4f})  {bar}')
+    print()
+
+
 class RenderedFVMDataset(Dataset):
     """
     Rolling-window samples from one simulation run, rendered to pixel grids.
@@ -291,6 +311,9 @@ class FVMLightningModel(L.LightningModule):
         else:
             c_print('Warning: pixel_mask.pt not found — all pixels treated as fluid', color='yellow')
 
+    def on_train_epoch_start(self) -> None:
+        self._epoch_errs: list[torch.Tensor] = []
+
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         window, target = batch
         pred        = self(window)
@@ -303,9 +326,17 @@ class FVMLightningModel(L.LightningModule):
         rel_err = ((target - pred_denorm).abs()[valid] /
                    target.abs()[valid].clamp(min=1e-6)).mean()
 
+        self._epoch_errs.append(err.detach().cpu())
+
         self.log('train_loss', loss,    on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('rel_err',    rel_err, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
+
+    def on_train_epoch_end(self) -> None:
+        if self.global_rank == 0 and self._epoch_errs:
+            all_errs = torch.cat(self._epoch_errs)
+            _print_histogram(all_errs, title=f'Epoch {self.current_epoch} error distribution')
+        self._epoch_errs = []
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
