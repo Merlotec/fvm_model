@@ -145,8 +145,11 @@ def _print_histogram(values: torch.Tensor, title: str, bins: int = 25, width: in
     if n == 0:
         return
     v = values.float().cpu()
-    lo  = torch.quantile(v, 0.01).item()
-    hi  = torch.quantile(v, 0.99).item()
+    # torch.quantile is limited to 2^24 elements — subsample for statistics only
+    max_q = 1 << 24
+    v_q = v[torch.randperm(n)[:max_q]] if n > max_q else v
+    lo  = torch.quantile(v_q, 0.01).item()
+    hi  = torch.quantile(v_q, 0.99).item()
     if lo >= hi:
         hi = lo + 1e-6
     counts = torch.histc(v, bins=bins, min=lo, max=hi)
