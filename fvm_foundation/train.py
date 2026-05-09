@@ -33,6 +33,7 @@ EMB_DIM     = _HP['emb_dim']
 N_CHANNELS  = _HP['n_channels']
 WINDOW_SIZE = _HP['window_size']
 NUM_LAYERS  = _HP['num_layers']
+FIRST_FRAME = _HP['first_frame']
 
 DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
 INPUT_STATS_PATH = Path(__file__).resolve().parent / 'input_stats.json'
@@ -173,13 +174,14 @@ class RenderedFVMDataset(Dataset):
     """
 
     def __init__(self, sim_dir: Path, renderer: MeshRenderer, window_size: int,
-                 skip_initial: int = 20):
+                 first_frame: int = 20):
         files = sorted(
             [f for f in os.listdir(sim_dir) if f.startswith('t_') and f.endswith('.npz')],
             key=lambda f: float(f[2:-4]),
         )
-        # Drop early transient frames — deltas are 10-100× larger than settled state
-        self.paths       = [sim_dir / f for f in files][skip_initial:]
+        # Start from first_frame so the first window covers [first_frame, first_frame+window_size)
+        # and the first prediction target is frame first_frame+window_size
+        self.paths       = [sim_dir / f for f in files][first_frame:]
         self.renderer    = renderer
         self.window_size = window_size
 
@@ -207,14 +209,14 @@ class FVMDataModule(L.LightningDataModule):
         window_size:  int = WINDOW_SIZE,
         batch_size:   int = 4,
         num_workers:  int = 4,
-        skip_initial: int = 20,
+        first_frame:  int = FIRST_FRAME,
     ):
         super().__init__()
         self.data_dir     = Path(data_dir)
         self.window_size  = window_size
         self.batch_size   = batch_size
         self.num_workers  = num_workers
-        self.skip_initial = skip_initial
+        self.first_frame  = first_frame
         self._renderer: MeshRenderer | None = None
 
     def setup(self, stage: str | None = None):
@@ -225,7 +227,7 @@ class FVMDataModule(L.LightningDataModule):
         subdirs = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
         datasets = [
             RenderedFVMDataset(d, self._renderer, self.window_size,
-                               skip_initial=self.skip_initial)
+                               first_frame=self.first_frame)
             for d in subdirs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]

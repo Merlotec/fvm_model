@@ -57,6 +57,8 @@ PATCH_SIZE  = _HP['patch_size']
 EMB_DIM     = _HP['emb_dim']
 N_CHANNELS  = _HP['n_channels']
 WINDOW_SIZE = _HP['window_size']
+NUM_LAYERS  = _HP['num_layers']
+FIRST_FRAME = _HP['first_frame']
 
 from train import DATASET_DIR, build_renderer
 
@@ -126,6 +128,7 @@ def run_inference(
         patch_size   = PATCH_SIZE,
         emb_dim      = EMB_DIM,
         num_channels = N_CHANNELS,
+        num_layers   = NUM_LAYERS,
     ).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     # Lightning checkpoints nest weights under 'state_dict' with a 'model.' prefix
@@ -171,20 +174,22 @@ def run_inference(
 
     # ---- input files ----
     all_files = _find_timestep_files(sim_dir)
-    if len(all_files) < WINDOW_SIZE:
-        c_print(f'Skipping {sim_dir} — only {len(all_files)} timesteps (need {WINDOW_SIZE}).', color='yellow')
+    needed = FIRST_FRAME + WINDOW_SIZE
+    if len(all_files) < needed:
+        c_print(f'Skipping {sim_dir} — only {len(all_files)} timesteps (need {needed}).', color='yellow')
         return
 
     if n_steps is None:
-        n_steps = max(1, len(all_files) - WINDOW_SIZE)
+        n_steps = max(1, len(all_files) - needed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     c_print(f'Output: {out_dir}', color='cyan')
-    c_print(f'Seed frames: {WINDOW_SIZE}  |  Prediction steps: {n_steps}', color='cyan')
+    c_print(f'first_frame: {FIRST_FRAME}  |  Seed frames: {WINDOW_SIZE}  |  Prediction steps: {n_steps}', color='cyan')
 
     # ---- seed window ----
-    # Render the first WINDOW_SIZE frames and save them as seed frames.
-    seed_files = all_files[:WINDOW_SIZE]
+    # Seed from [first_frame, first_frame + WINDOW_SIZE) so inference starts
+    # from the same settled-flow region used during training.
+    seed_files = all_files[FIRST_FRAME:FIRST_FRAME + WINDOW_SIZE]
     window: list[torch.Tensor] = []
 
     c_print('Rendering seed frames...', color='yellow')
