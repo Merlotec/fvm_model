@@ -10,7 +10,7 @@
     "num_workers": 4,
     "devices": -1,
     "num_nodes": 1,
-    "precision": "32",
+    "precision": "bf16-mixed",
     "num_layers": 6,
     "first_frame": 20
 }
