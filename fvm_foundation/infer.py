@@ -109,11 +109,12 @@ def _save_frame(out_dir: Path, t: float, grid: np.ndarray, is_seed: bool) -> Non
 
 
 def run_inference(
-    sim_dir:    Path,
-    checkpoint: Path,
-    out_dir:    Path,
-    n_steps:    int | None = None,
-    data_dir:   Path = DATASET_DIR,
+    sim_dir:         Path,
+    checkpoint:      Path,
+    out_dir:         Path,
+    n_steps:         int | None = None,
+    data_dir:        Path = DATASET_DIR,
+    teacher_forcing: bool = False,
 ) -> None:
     device = _select_device()
     c_print(f'Device: {device}', color='cyan')
@@ -184,7 +185,8 @@ def run_inference(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     c_print(f'Output: {out_dir}', color='cyan')
-    c_print(f'first_frame: {FIRST_FRAME}  |  Seed frames: {WINDOW_SIZE}  |  Prediction steps: {n_steps}', color='cyan')
+    mode_label = 'teacher-forcing' if teacher_forcing else 'autoregressive'
+    c_print(f'first_frame: {FIRST_FRAME}  |  Seed frames: {WINDOW_SIZE}  |  Prediction steps: {n_steps}  |  Mode: {mode_label}', color='cyan')
 
     # ---- seed window ----
     # Seed from [first_frame, first_frame + WINDOW_SIZE) so inference starts
@@ -206,8 +208,9 @@ def run_inference(
         dt = 0.1
     t_next = _t_of(seed_files[-1]) + dt
 
-    # ---- autoregressive rollout ----
+    # ---- rollout ----
     c_print('Running inference...', color='yellow')
+
     def _normalise_window(frames):
         """Stack frames into model input, normalise per-channel, zero background."""
         inp = torch.cat(frames, dim=0).unsqueeze(0)   # (1, W*C, H, W)
@@ -230,21 +233,28 @@ def run_inference(
             _save_frame(out_dir, t_next, pred.cpu().numpy(), is_seed=False)
             c_print(f'  pred  t={t_next:.4g}  [{step + 1}/{n_steps}]  raw={raw_delta.abs().mean():.4f}  delta={delta.abs().mean():.4f}', color='bright_green')
 
-            # Slide window: drop oldest frame, append prediction
+            # Slide window forward
+            next_gt_idx = FIRST_FRAME + WINDOW_SIZE + step
+            if teacher_forcing and next_gt_idx < len(all_files):
+                # Use the real next frame from the simulation instead of the prediction
+                next_frame = _load_and_render(all_files[next_gt_idx], renderer)
+            else:
+                next_frame = pred
             window.pop(0)
-            window.append(pred)
+            window.append(next_frame)
             t_next += dt
 
     c_print(f'\nDone. {n_steps} frames written to {out_dir}', color='bright_magenta')
 
 
 def run_inference_random(
-    data_dir:   Path,
-    checkpoint: Path,
-    out_root:   Path,
-    n_runs:     int,
-    n_steps:    int | None = None,
-    seed:       int        = 0,
+    data_dir:        Path,
+    checkpoint:      Path,
+    out_root:        Path,
+    n_runs:          int,
+    n_steps:         int | None = None,
+    seed:            int        = 0,
+    teacher_forcing: bool       = False,
 ) -> None:
     """
     Run inference on a random subset of simulation directories under data_dir.
@@ -266,11 +276,12 @@ def run_inference_random(
     for i, sim_dir in enumerate(selected):
         c_print(f'\n[{i + 1}/{n_runs}]  {sim_dir.name}', color='bright_cyan')
         run_inference(
-            sim_dir    = sim_dir,
-            checkpoint = checkpoint,
-            out_dir    = out_root / sim_dir.name,
-            n_steps    = n_steps,
-            data_dir   = data_dir,
+            sim_dir          = sim_dir,
+            checkpoint       = checkpoint,
+            out_dir          = out_root / sim_dir.name,
+            n_steps          = n_steps,
+            data_dir         = data_dir,
+            teacher_forcing  = teacher_forcing,
         )
 
 
@@ -295,24 +306,29 @@ def main():
 
     parser.add_argument('--seed', type=int, default=0,
                         help='Random seed for -r selection (default: 0)')
+    parser.add_argument('--teacher-forcing', action='store_true',
+                        help='Use ground-truth frames as window input at each step '
+                             'instead of the model\'s own predictions')
     args = parser.parse_args()
 
     if args.random is not None:
         run_inference_random(
-            data_dir   = args.data_dir,
-            checkpoint = args.checkpoint,
-            out_root   = args.out_dir,
-            n_runs     = args.random,
-            n_steps    = args.steps,
-            seed       = args.seed,
+            data_dir        = args.data_dir,
+            checkpoint      = args.checkpoint,
+            out_root        = args.out_dir,
+            n_runs          = args.random,
+            n_steps         = args.steps,
+            seed            = args.seed,
+            teacher_forcing = args.teacher_forcing,
         )
     else:
         run_inference(
-            sim_dir    = args.sim_dir,
-            checkpoint = args.checkpoint,
-            out_dir    = args.out_dir,
-            n_steps    = args.steps,
-            data_dir   = args.data_dir,
+            sim_dir         = args.sim_dir,
+            checkpoint      = args.checkpoint,
+            out_dir         = args.out_dir,
+            n_steps         = args.steps,
+            data_dir        = args.data_dir,
+            teacher_forcing = args.teacher_forcing,
         )
 
 
