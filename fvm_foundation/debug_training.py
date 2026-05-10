@@ -38,10 +38,11 @@ from model import FluidVisionModel
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
 from renderer import MeshRenderer
 
-from train import (
+from helper import (
     DATASET_DIR, RESOLUTION, PATCH_SIZE, EMB_DIM, N_CHANNELS, WINDOW_SIZE,
-    DELTA_STATS_PATH, FVMDataModule, build_renderer,
+    DELTA_STATS_PATH, build_renderer,
 )
+from data import FVMDataModule
 
 H, W        = RESOLUTION
 NUM_PATCHES = (H // PATCH_SIZE) * (W // PATCH_SIZE)

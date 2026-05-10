@@ -1,75 +1,38 @@
 """
 Run autoregressive inference with a trained FluidVisionModel.
 
-The first WINDOW_SIZE frames from the input sim directory are used as the
-seed window and copied to the output directory marked as seed frames.
-The model then rolls out autoregressively, predicting one frame at a time
-and feeding each prediction back as input.
+The seed window is taken from [first_frame, first_frame + WINDOW_SIZE) in the
+simulation directory, matching the training regime.  The model then rolls out
+autoregressively, or optionally with teacher forcing (real frames used as
+window input at every step).
 
 Usage
 -----
-    python infer.py path/to/sim_dir/ path/to/checkpoints/model.pt path/to/output_dir/
+    python infer.py <checkpoint> <out_dir> <sim_dir> [options]
+    python infer.py <checkpoint> <out_dir> -r N      [options]
 
-    # Predict a specific number of steps (default: all remaining frames in sim_dir):
-    python infer.py path/to/sim_dir/ path/to/model.pt path/to/out/ --steps 50
-
-Output directory structure mirrors the input:
+Output directory structure:
     output_dir/
-        t_0.0000.npz   # seed  (is_seed=True,  grid=(4,H,W))
-        t_0.1000.npz   # seed
-        ...
-        t_0.9000.npz   # seed  (last seed frame)
-        t_1.0000.npz   # pred  (is_seed=False, grid=(4,H,W))
-        t_1.1000.npz   # pred
-        ...
-
-Each .npz contains:
-    grid      : (4, H, W) float32 rendered field
-    t         : scalar float timestamp
-    is_seed   : bool
+        t_<t>.npz   # is_seed=True  for seed frames
+        t_<t>.npz   # is_seed=False for predicted frames
 """
 
-import json
-import sys
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from cprint import c_print
 
-# Path setup mirrors train.py
-_SOLVER_DIR = Path(__file__).resolve().parents[2] / 'fvm_solver'
-if str(_SOLVER_DIR) not in sys.path:
-    sys.path.insert(0, str(_SOLVER_DIR))
-
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'src'))
-from model import FluidVisionModel
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
-from renderer import MeshRenderer
+from helper import (
+    DATASET_DIR, RESOLUTION, WINDOW_SIZE, FIRST_FRAME,
+    build_renderer,
+)
+from lightning_model import FVMLightningModel
 
-with open(Path(__file__).resolve().parent / 'hyperparams.json') as _f:
-    _HP = json.load(_f)
-
-RESOLUTION  = tuple(_HP['resolution'])
-PATCH_SIZE  = _HP['patch_size']
-EMB_DIM     = _HP['emb_dim']
-N_CHANNELS  = _HP['n_channels']
-WINDOW_SIZE = _HP['window_size']
-NUM_LAYERS  = _HP['num_layers']
-FIRST_FRAME = _HP['first_frame']
-
-from train import DATASET_DIR, build_renderer
-
-FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
-
-_DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _select_device() -> str:
     if torch.cuda.is_available():
@@ -80,18 +43,17 @@ def _select_device() -> str:
 
 
 def _find_timestep_files(sim_dir: Path) -> list[Path]:
-    files = sorted(
+    return sorted(
         [f for f in sim_dir.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
         key=lambda f: float(f.stem[2:]),
     )
-    return files
 
 
-def _load_and_render(path: Path, renderer: MeshRenderer) -> torch.Tensor:
+def _load_and_render(path: Path, renderer) -> torch.Tensor:
     """Load a raw timestep file and return a rendered (N_CHANNELS, H, W) tensor."""
     d      = np.load(path)
     values = d['cell_primatives'].astype(np.float32) * d['prim_std'] + d['prim_mean']
-    return renderer.render_cell_smooth(values).nan_to_num(0.0)   # (N_CHANNELS, H, W)
+    return renderer.render_cell_smooth(values).nan_to_num(0.0)
 
 
 def _t_of(path: Path) -> float:
@@ -99,9 +61,8 @@ def _t_of(path: Path) -> float:
 
 
 def _save_frame(out_dir: Path, t: float, grid: np.ndarray, is_seed: bool) -> None:
-    fname = f"t_{t:.4g}.npz"
     np.savez_compressed(
-        out_dir / fname,
+        out_dir / f't_{t:.4g}.npz',
         grid    = grid,
         t       = np.float32(t),
         is_seed = np.bool_(is_seed),
@@ -121,57 +82,9 @@ def run_inference(
 
     renderer = build_renderer(data_dir, RESOLUTION, device)
 
-    H, W        = RESOLUTION
-    num_patches = (H // PATCH_SIZE) * (W // PATCH_SIZE)
-    model = FluidVisionModel(
-        num_obs      = WINDOW_SIZE,
-        num_patches  = num_patches,
-        patch_size   = PATCH_SIZE,
-        emb_dim      = EMB_DIM,
-        num_channels = N_CHANNELS,
-        num_layers   = NUM_LAYERS,
-    ).to(device)
-    ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
-    # Lightning checkpoints nest weights under 'state_dict' with a 'model.' prefix
-    if 'state_dict' in ckpt:
-        state = {k.removeprefix('model.'): v for k, v in ckpt['state_dict'].items()}
-    else:
-        state = ckpt
-
-    # Extract normalisation buffers saved on the Lightning module before
-    # loading into FluidVisionModel (which doesn't have these buffers itself).
-    ckpt_delta_mean = state.pop('delta_mean', None)
-    ckpt_delta_std  = state.pop('delta_std',  None)
-    ckpt_input_mean = state.pop('input_mean', None)
-    ckpt_input_std  = state.pop('input_std',  None)
-
-    result = model.load_state_dict(state, strict=False)
-    if result.missing_keys:
-        c_print(f'Warning: checkpoint is missing keys: {result.missing_keys}', color='yellow')
-    if result.unexpected_keys:
-        c_print(f'Warning: unexpected keys in checkpoint (not loaded): {result.unexpected_keys}', color='yellow')
+    model = FVMLightningModel.load_from_checkpoint(str(checkpoint), map_location=device)
     model.eval()
     c_print(f'Loaded checkpoint: {checkpoint}', color='green')
-
-    _INPUT_STATS_PATH = Path(__file__).resolve().parent / 'input_stats.json'
-
-    def _load_pair(ckpt_m, ckpt_s, json_path, label):
-        if ckpt_m is not None and ckpt_s is not None:
-            c_print(f'Loaded {label} from checkpoint', color='green')
-            return ckpt_m.to(device).view(-1, 1, 1), ckpt_s.to(device).view(-1, 1, 1)
-        if json_path.exists():
-            with open(json_path) as _f:
-                s = json.load(_f)
-            c_print(f'Loaded {label} from {json_path.name} (fallback)', color='yellow')
-            return (torch.tensor(s['mean'], device=device).view(-1, 1, 1),
-                    torch.tensor(s['std'],  device=device).view(-1, 1, 1))
-        c_print(f'Warning: no {label} found — using identity', color='yellow')
-        return None, None
-
-    delta_mean, delta_std = _load_pair(ckpt_delta_mean, ckpt_delta_std,
-                                       _DELTA_STATS_PATH, 'delta normalisation')
-    input_mean, input_std = _load_pair(ckpt_input_mean, ckpt_input_std,
-                                       _INPUT_STATS_PATH, 'input normalisation')
 
     # ---- input files ----
     all_files = _find_timestep_files(sim_dir)
@@ -184,59 +97,39 @@ def run_inference(
         n_steps = max(1, len(all_files) - needed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    c_print(f'Output: {out_dir}', color='cyan')
     mode_label = 'teacher-forcing' if teacher_forcing else 'autoregressive'
-    c_print(f'first_frame: {FIRST_FRAME}  |  Seed frames: {WINDOW_SIZE}  |  Prediction steps: {n_steps}  |  Mode: {mode_label}', color='cyan')
+    c_print(f'Output: {out_dir}', color='cyan')
+    c_print(f'first_frame: {FIRST_FRAME}  |  seed: {WINDOW_SIZE}  |  steps: {n_steps}  |  mode: {mode_label}', color='cyan')
 
     # ---- seed window ----
-    # Seed from [first_frame, first_frame + WINDOW_SIZE) so inference starts
-    # from the same settled-flow region used during training.
     seed_files = all_files[FIRST_FRAME:FIRST_FRAME + WINDOW_SIZE]
     window: list[torch.Tensor] = []
 
     c_print('Rendering seed frames...', color='yellow')
     for path in seed_files:
-        grid = _load_and_render(path, renderer)   # (N_CHANNELS, H, W) on device
+        grid = _load_and_render(path, renderer)
         window.append(grid)
         _save_frame(out_dir, _t_of(path), grid.cpu().numpy(), is_seed=True)
         c_print(f'  seed  t={_t_of(path):.4g}', color='bright_black')
 
-    # Infer dt from the seed files for extrapolating prediction timestamps.
-    if len(seed_files) >= 2:
-        dt = _t_of(seed_files[-1]) - _t_of(seed_files[-2])
-    else:
-        dt = 0.1
+    dt     = _t_of(seed_files[-1]) - _t_of(seed_files[-2]) if len(seed_files) >= 2 else 0.1
     t_next = _t_of(seed_files[-1]) + dt
 
     # ---- rollout ----
     c_print('Running inference...', color='yellow')
-
-    def _normalise_window(frames):
-        """Stack frames into model input, normalise per-channel, zero background."""
-        inp = torch.cat(frames, dim=0).unsqueeze(0)   # (1, W*C, H, W)
-        if input_mean is not None and input_std is not None:
-            nm = input_mean.repeat(WINDOW_SIZE, 1, 1).unsqueeze(0)
-            ns = input_std.repeat( WINDOW_SIZE, 1, 1).unsqueeze(0)
-            inp = ((inp - nm) / ns).nan_to_num(0.0)
-        else:
-            inp = inp.nan_to_num(0.0)
-        return inp
-
     with torch.no_grad():
         for step in range(n_steps):
-            inp = _normalise_window(window)
-
-            raw_delta = model(inp).squeeze(0)             # (N_CHANNELS, H, W)
-            delta = raw_delta * delta_std + delta_mean if delta_mean is not None else raw_delta
-            pred  = window[-1] + delta
+            inp       = torch.cat(window, dim=0).unsqueeze(0).to(device)  # (1, W*C, H, W)
+            pred_norm = model(inp).squeeze(0)                              # (C, H, W) normalised
+            delta     = model.denormalise(pred_norm)                       # (C, H, W) physical
+            pred      = window[-1] + delta
 
             _save_frame(out_dir, t_next, pred.cpu().numpy(), is_seed=False)
-            c_print(f'  pred  t={t_next:.4g}  [{step + 1}/{n_steps}]  raw={raw_delta.abs().mean():.4f}  delta={delta.abs().mean():.4f}', color='bright_green')
+            c_print(f'  pred  t={t_next:.4g}  [{step+1}/{n_steps}]  '
+                    f'delta={delta.abs().mean():.4f}', color='bright_green')
 
-            # Slide window forward
             next_gt_idx = FIRST_FRAME + WINDOW_SIZE + step
             if teacher_forcing and next_gt_idx < len(all_files):
-                # Use the real next frame from the simulation instead of the prediction
                 next_frame = _load_and_render(all_files[next_gt_idx], renderer)
             else:
                 next_frame = pred
@@ -256,11 +149,7 @@ def run_inference_random(
     seed:            int        = 0,
     teacher_forcing: bool       = False,
 ) -> None:
-    """
-    Run inference on a random subset of simulation directories under data_dir.
-
-    Each run is written to out_root/<sim_name>/ mirroring the input layout.
-    """
+    """Run inference on a random subset of simulation directories under data_dir."""
     import random
     random.seed(seed)
 
@@ -274,41 +163,36 @@ def run_inference_random(
     c_print(f'Selected {n_runs}/{len(sim_dirs)} runs from {data_dir}', color='cyan')
 
     for i, sim_dir in enumerate(selected):
-        c_print(f'\n[{i + 1}/{n_runs}]  {sim_dir.name}', color='bright_cyan')
+        c_print(f'\n[{i+1}/{n_runs}]  {sim_dir.name}', color='bright_cyan')
         run_inference(
-            sim_dir          = sim_dir,
-            checkpoint       = checkpoint,
-            out_dir          = out_root / sim_dir.name,
-            n_steps          = n_steps,
-            data_dir         = data_dir,
-            teacher_forcing  = teacher_forcing,
+            sim_dir         = sim_dir,
+            checkpoint      = checkpoint,
+            out_dir         = out_root / sim_dir.name,
+            n_steps         = n_steps,
+            data_dir        = data_dir,
+            teacher_forcing = teacher_forcing,
         )
 
-
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('checkpoint', type=Path, help='Path to model .pt checkpoint')
+    parser.add_argument('checkpoint', type=Path, help='Path to Lightning checkpoint')
     parser.add_argument('out_dir',    type=Path, help='Output directory')
-    parser.add_argument('--steps',    type=int,  default=None,
-                        help='Number of frames to predict (default: len(sim_dir) - WINDOW_SIZE)')
+    parser.add_argument('--steps',    type=int,  default=None)
     parser.add_argument('--data-dir', type=Path, default=DATASET_DIR,
                         help='Dataset root containing shared_mesh.pkl / renderer cache')
+    parser.add_argument('--teacher-forcing', action='store_true',
+                        help='Use ground-truth frames as window input instead of model predictions')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Random seed for -r selection (default: 0)')
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('sim_dir', type=Path, nargs='?',
-                      help='Single simulation directory to run inference on')
+                      help='Single simulation directory')
     mode.add_argument('-r', '--random', type=int, metavar='N',
-                      help='Run inference on N randomly selected simulation directories '
-                           'from --data-dir, writing results to out_dir/<sim_name>/')
+                      help='Run on N randomly selected simulation directories')
 
-    parser.add_argument('--seed', type=int, default=0,
-                        help='Random seed for -r selection (default: 0)')
-    parser.add_argument('--teacher-forcing', action='store_true',
-                        help='Use ground-truth frames as window input at each step '
-                             'instead of the model\'s own predictions')
     args = parser.parse_args()
 
     if args.random is not None:
