@@ -6,9 +6,7 @@ sys.path.insert(0, str(HERE / 'src'))
 sys.path.insert(0, str(HERE.parents[0] / 'fvm_gen'))
 sys.path.insert(0, str(HERE.parents[0] / 'fvm_solver'))
 
-from helper import N_CHANNELS, INPUT_STATS_PATH, DELTA_STATS_PATH
-from data import FVMDataModule
-from lightning_model import FVMLightningModel
+from train import FVMDataModule, FVMLightningModel, N_CHANNELS, INPUT_STATS_PATH, DELTA_STATS_PATH
 
 DATA   = HERE.parent / 'data' / 'fvm_gen_datasets'
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
