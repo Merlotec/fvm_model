@@ -10,7 +10,7 @@ from cprint import c_print
 
 from helper import (
     build_renderer, build_pixel_mask, compute_delta_stats, compute_input_stats,
-    RESOLUTION, WINDOW_SIZE, FIRST_FRAME, PUSHFORWARD_K,
+    RESOLUTION, WINDOW_SIZE, FIRST_FRAME,
     DELTA_STATS_PATH, INPUT_STATS_PATH, PIXEL_MASK_PATH,
 )
 
@@ -19,35 +19,32 @@ class RenderedFVMDataset(Dataset):
     """
     Rolling-window samples from one simulation run, rendered to pixel grids.
 
-    Each sample is (window, targets):
-        window  : (WINDOW_SIZE * N_channels, H, W)
-        targets : (pushforward_k, N_channels, H, W)  — K ground-truth frames after the window
-    The training loop computes deltas on the fly so that pushforward targets are
-    always relative to the model's own running predictions.
+    Each sample is (window, target):
+        window : (WINDOW_SIZE * N_channels, H, W)
+        target : (N_channels, H, W)  — delta from last window frame to next frame
     """
 
     def __init__(self, sim_dir: Path, renderer, window_size: int,
-                 first_frame: int = FIRST_FRAME, pushforward_k: int = PUSHFORWARD_K):
+                 first_frame: int = FIRST_FRAME):
         files = sorted(
             [f for f in os.listdir(sim_dir) if f.startswith('t_') and f.endswith('.npz')],
             key=lambda f: float(f[2:-4]),
         )
-        self.paths        = [sim_dir / f for f in files][first_frame:]
-        self.renderer     = renderer
-        self.window_size  = window_size
-        self.pushforward_k = pushforward_k
+        # Start from first_frame so the first window covers [first_frame, first_frame+window_size)
+        # and the first prediction target is frame first_frame+window_size
+        self.paths       = [sim_dir / f for f in files][first_frame:]
+        self.renderer    = renderer
+        self.window_size = window_size
 
     def __len__(self) -> int:
-        return max(0, len(self.paths) - self.window_size - self.pushforward_k + 1)
+        return max(0, len(self.paths) - self.window_size)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        frames  = [self._render(self.paths[idx + i]) for i in range(self.window_size)]
-        window  = torch.cat(frames, dim=0)
-        targets = torch.stack([
-            self._render(self.paths[idx + self.window_size + k])
-            for k in range(self.pushforward_k)
-        ])
-        return window, targets
+        frames     = [self._render(self.paths[idx + i]) for i in range(self.window_size)]
+        window     = torch.cat(frames, dim=0)
+        target     = self._render(self.paths[idx + self.window_size])
+        last_frame = frames[-1]
+        return window, target - last_frame
 
     def _render(self, path: Path) -> torch.Tensor:
         d      = np.load(path)
@@ -58,21 +55,19 @@ class RenderedFVMDataset(Dataset):
 class FVMDataModule(L.LightningDataModule):
     def __init__(
         self,
-        data_dir:      Path,
-        window_size:   int = WINDOW_SIZE,
-        batch_size:    int = 4,
-        num_workers:   int = 4,
-        first_frame:   int = FIRST_FRAME,
-        pushforward_k: int = PUSHFORWARD_K,
+        data_dir:    Path,
+        window_size: int = WINDOW_SIZE,
+        batch_size:  int = 4,
+        num_workers: int = 4,
+        first_frame: int = FIRST_FRAME,
     ):
         super().__init__()
-        self.data_dir      = Path(data_dir)
-        self.window_size   = window_size
-        self.batch_size    = batch_size
-        self.num_workers   = num_workers
-        self.first_frame   = first_frame
-        self.pushforward_k = pushforward_k
-        self._renderer     = None
+        self.data_dir    = Path(data_dir)
+        self.window_size = window_size
+        self.batch_size  = batch_size
+        self.num_workers = num_workers
+        self.first_frame = first_frame
+        self._renderer   = None
 
     def setup(self, stage: str | None = None):
         c_print('Building renderer...', color='yellow')
@@ -82,8 +77,7 @@ class FVMDataModule(L.LightningDataModule):
         subdirs  = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
         datasets = [
             RenderedFVMDataset(d, self._renderer, self.window_size,
-                               first_frame=self.first_frame,
-                               pushforward_k=self.pushforward_k)
+                               first_frame=self.first_frame)
             for d in subdirs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]

@@ -11,13 +11,13 @@ from model import FluidVisionModel
 
 from helper import (
     print_histogram,
-    RESOLUTION, PATCH_SIZE, EMB_DIM, N_CHANNELS, WINDOW_SIZE, NUM_LAYERS, PUSHFORWARD_K,
+    RESOLUTION, PATCH_SIZE, EMB_DIM, N_CHANNELS, WINDOW_SIZE, NUM_LAYERS,
     DELTA_STATS_PATH, INPUT_STATS_PATH, PIXEL_MASK_PATH,
 )
 
 
 class FVMLightningModel(L.LightningModule):
-    def __init__(self, lr: float = 1e-4, pushforward_k: int = PUSHFORWARD_K):
+    def __init__(self, lr: float = 1e-4):
         super().__init__()
         self.save_hyperparameters()
         H, W        = RESOLUTION
@@ -75,50 +75,22 @@ class FVMLightningModel(L.LightningModule):
         self._epoch_errs: list[torch.Tensor] = []
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        window, targets = batch  # (B, W*C, H, W), (B, K, C, H, W)
-        K = targets.shape[1]
+        window, target = batch
+        pred        = self(window)
+        target_norm = (target - self.delta_mean) / self.delta_std
+        valid       = self.pixel_mask.expand_as(target_norm)
+        err         = (pred - target_norm)[valid]
+        loss        = err.pow(2).mean() + err.abs().mean()
 
-        # Split window into a list of per-frame tensors for the rollout
-        frames = list(window.chunk(WINDOW_SIZE, dim=1))  # list of K (B, C, H, W)
+        pred_denorm = self.denormalise(pred)
+        rel_err = ((target - pred_denorm).abs()[valid] /
+                   target.abs()[valid].clamp(min=1e-6)).mean()
 
-        total_loss    = torch.tensor(0.0, device=self.device)
-        total_rel_err = torch.tensor(0.0, device=self.device)
-        step_errs: list[torch.Tensor] = []
+        self._epoch_errs.append(err.detach().cpu())
 
-        for k in range(K):
-            inp       = torch.cat(frames, dim=1)   # (B, W*C, H, W)
-            pred_norm = self(inp)                   # (B, C, H, W) normalised delta
-
-            gt_next   = targets[:, k]              # (B, C, H, W)
-            # Detach last_frame for target so gradient flows only through pred_norm and
-            # through the model input (not via the normalisation denominator).
-            gt_delta     = gt_next - frames[-1].detach()
-            target_norm  = (gt_delta - self.delta_mean) / self.delta_std
-
-            valid = self.pixel_mask.expand_as(target_norm)
-            err   = (pred_norm - target_norm)[valid]
-            loss  = err.pow(2).mean() + err.abs().mean()
-            total_loss = total_loss + loss
-
-            pred_denorm   = self.denormalise(pred_norm)
-            rel_err       = ((gt_delta - pred_denorm).abs()[valid] /
-                             gt_delta.abs()[valid].clamp(min=1e-6)).mean()
-            total_rel_err = total_rel_err + rel_err
-
-            step_errs.append(err.detach().cpu())
-
-            # Advance the sliding window: push the predicted frame, keeping the gradient
-            # chain intact so that future steps can propagate back through this prediction.
-            pred_frame = frames[-1].detach() + pred_denorm
-            frames = frames[1:] + [pred_frame]
-
-        self._epoch_errs.append(torch.cat(step_errs))
-
-        avg_loss    = total_loss    / K
-        avg_rel_err = total_rel_err / K
-        self.log('train_loss', avg_loss,    on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('rel_err',    avg_rel_err, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        return avg_loss
+        self.log('train_loss', loss,    on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('rel_err',    rel_err, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        return loss
 
     def on_train_epoch_end(self) -> None:
         if self.global_rank == 0 and self._epoch_errs:
