@@ -10,41 +10,41 @@ from cprint import c_print
 
 from helper import (
     build_renderer, build_pixel_mask, compute_delta_stats, compute_input_stats,
-    RESOLUTION, WINDOW_SIZE, FIRST_FRAME,
+    RESOLUTION, FIRST_FRAME, SEQ_LEN,
     DELTA_STATS_PATH, INPUT_STATS_PATH, PIXEL_MASK_PATH,
 )
 
 
 class RenderedFVMDataset(Dataset):
     """
-    Rolling-window samples from one simulation run, rendered to pixel grids.
+    Full-sequence chunks from one simulation run, rendered to pixel grids.
 
-    Each sample is (window, target):
-        window : (WINDOW_SIZE * N_channels, H, W)
-        target : (N_channels, H, W)  — delta from last window frame to next frame
+    Each sample is (frames, targets):
+        frames  : (seq_len, N_channels, H, W)  — input frames
+        targets : (seq_len, N_channels, H, W)  — per-step delta to the next frame
+    The model predicts all seq_len deltas in one forward pass via causal attention.
     """
 
-    def __init__(self, sim_dir: Path, renderer, window_size: int,
+    def __init__(self, sim_dir: Path, renderer, seq_len: int = SEQ_LEN,
                  first_frame: int = FIRST_FRAME):
         files = sorted(
             [f for f in os.listdir(sim_dir) if f.startswith('t_') and f.endswith('.npz')],
             key=lambda f: float(f[2:-4]),
         )
-        # Start from first_frame so the first window covers [first_frame, first_frame+window_size)
-        # and the first prediction target is frame first_frame+window_size
-        self.paths       = [sim_dir / f for f in files][first_frame:]
-        self.renderer    = renderer
-        self.window_size = window_size
+        self.paths    = [sim_dir / f for f in files][first_frame:]
+        self.renderer = renderer
+        self.seq_len  = seq_len
 
     def __len__(self) -> int:
-        return max(0, len(self.paths) - self.window_size)
+        # Need seq_len + 1 consecutive frames: seq_len inputs + 1 lookahead for the last target
+        return max(0, len(self.paths) - self.seq_len)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        frames     = [self._render(self.paths[idx + i]) for i in range(self.window_size)]
-        window     = torch.cat(frames, dim=0)
-        target     = self._render(self.paths[idx + self.window_size])
-        last_frame = frames[-1]
-        return window, target - last_frame
+        all_frames = [self._render(self.paths[idx + i]) for i in range(self.seq_len + 1)]
+        frames  = torch.stack(all_frames[:-1])                                     # (T, C, H, W)
+        targets = torch.stack([all_frames[i + 1] - all_frames[i]
+                               for i in range(self.seq_len)])                      # (T, C, H, W)
+        return frames, targets
 
     def _render(self, path: Path) -> torch.Tensor:
         d      = np.load(path)
@@ -56,14 +56,14 @@ class FVMDataModule(L.LightningDataModule):
     def __init__(
         self,
         data_dir:    Path,
-        window_size: int = WINDOW_SIZE,
+        seq_len:     int = SEQ_LEN,
         batch_size:  int = 4,
         num_workers: int = 4,
         first_frame: int = FIRST_FRAME,
     ):
         super().__init__()
         self.data_dir    = Path(data_dir)
-        self.window_size = window_size
+        self.seq_len     = seq_len
         self.batch_size  = batch_size
         self.num_workers = num_workers
         self.first_frame = first_frame
@@ -76,7 +76,7 @@ class FVMDataModule(L.LightningDataModule):
         c_print('Scanning simulation directories...', color='yellow')
         subdirs  = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
         datasets = [
-            RenderedFVMDataset(d, self._renderer, self.window_size,
+            RenderedFVMDataset(d, self._renderer, seq_len=self.seq_len,
                                first_frame=self.first_frame)
             for d in subdirs
         ]

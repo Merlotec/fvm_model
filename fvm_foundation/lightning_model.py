@@ -37,8 +37,9 @@ class FVMLightningModel(L.LightningModule):
         self.register_buffer('pixel_mask', torch.ones(1, 1, H, W, dtype=torch.bool))
 
     def _normalise_window(self, window: torch.Tensor) -> torch.Tensor:
-        nm = self.input_mean.repeat(WINDOW_SIZE, 1, 1).unsqueeze(0)
-        ns = self.input_std.repeat( WINDOW_SIZE, 1, 1).unsqueeze(0)
+        # window: (B, T, C, H, W) — broadcast mean/std over B and T
+        nm = self.input_mean.unsqueeze(0).unsqueeze(0)  # (1, 1, C, 1, 1)
+        ns = self.input_std.unsqueeze(0).unsqueeze(0)
         return ((window - nm) / ns).nan_to_num(0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -75,16 +76,18 @@ class FVMLightningModel(L.LightningModule):
         self._epoch_errs: list[torch.Tensor] = []
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        window, target = batch
-        pred        = self(window)
-        target_norm = (target - self.delta_mean) / self.delta_std
-        valid       = self.pixel_mask.expand_as(target_norm)
-        err         = (pred - target_norm)[valid]
-        loss        = err.pow(2).mean() + err.abs().mean()
+        frames, targets = batch                                    # (B, T, C, H, W) each
+        pred            = self(frames)                             # (B, T, C, H, W) norm delta
+        target_norm     = (targets - self.delta_mean) / self.delta_std
+
+        # pixel_mask is (1,1,H,W) — unsqueeze to (1,1,1,H,W) to broadcast over B,T,C
+        valid = self.pixel_mask.unsqueeze(0).expand_as(target_norm)
+        err   = (pred - target_norm)[valid]
+        loss  = err.pow(2).mean() + err.abs().mean()
 
         pred_denorm = self.denormalise(pred)
-        rel_err = ((target - pred_denorm).abs()[valid] /
-                   target.abs()[valid].clamp(min=1e-6)).mean()
+        rel_err = ((targets - pred_denorm).abs()[valid] /
+                   targets.abs()[valid].clamp(min=1e-6)).mean()
 
         self._epoch_errs.append(err.detach().cpu())
 

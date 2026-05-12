@@ -213,10 +213,10 @@ def run_inference(
 
     def _normalise_window(frames):
         """Stack frames into model input, normalise per-channel, zero background."""
-        inp = torch.cat(frames, dim=0).unsqueeze(0)   # (1, W*C, H, W)
+        inp = torch.stack(frames, dim=0).unsqueeze(0)  # (1, T, C, H, W)
         if input_mean is not None and input_std is not None:
-            nm = input_mean.repeat(WINDOW_SIZE, 1, 1).unsqueeze(0)
-            ns = input_std.repeat( WINDOW_SIZE, 1, 1).unsqueeze(0)
+            nm = input_mean.unsqueeze(0).unsqueeze(0)  # (1, 1, C, 1, 1)
+            ns = input_std.unsqueeze(0).unsqueeze(0)
             inp = ((inp - nm) / ns).nan_to_num(0.0)
         else:
             inp = inp.nan_to_num(0.0)
@@ -226,7 +226,7 @@ def run_inference(
         for step in range(n_steps):
             inp = _normalise_window(window)
 
-            raw_delta = model(inp).squeeze(0)             # (N_CHANNELS, H, W)
+            raw_delta = model(inp).squeeze(0)[-1]         # (N_CHANNELS, H, W) — last timestep
             delta = raw_delta * delta_std + delta_mean if delta_mean is not None else raw_delta
             pred  = window[-1] + delta
 
