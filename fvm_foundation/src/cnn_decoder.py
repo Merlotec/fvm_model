@@ -1,23 +1,46 @@
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class CNNDecoder(nn.Module):
-    def __init__(self, emb_dim=768, out_channels=3):
+    """
+    Upsample patch tokens back to pixel resolution.
+
+    The number of stride-2 ConvTranspose stages is derived from patch_size:
+        n_ups = log2(patch_size)
+    so the grid goes G×G → (G*patch_size)×(G*patch_size) = H×W exactly.
+
+    Channel schedule per stage: 256 → 128 → 64 → 32 → 16 → 8 (truncated to n_ups stages).
+    """
+
+    _CHANNEL_SCHEDULE = [256, 128, 64, 32, 16, 8]
+
+    def __init__(self, emb_dim: int = 768, out_channels: int = 3, patch_size: int = 16):
         super().__init__()
-        self.up1        = nn.ConvTranspose2d(emb_dim, 256, kernel_size=2, stride=2)
-        self.up2        = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.up3        = nn.ConvTranspose2d(128,  64, kernel_size=2, stride=2)
-        self.up4        = nn.ConvTranspose2d( 64,  32, kernel_size=2, stride=2)
-        self.final_proj = nn.Conv2d(32, out_channels, kernel_size=3, padding=1)
+        assert patch_size >= 2 and (patch_size & (patch_size - 1)) == 0, \
+            "patch_size must be a power of 2"
+
+        n_ups = int(math.log2(patch_size))
+        assert n_ups <= len(self._CHANNEL_SCHEDULE), \
+            f"patch_size={patch_size} requires {n_ups} upsample stages but only " \
+            f"{len(self._CHANNEL_SCHEDULE)} are defined in _CHANNEL_SCHEDULE"
+
+        channel_sizes = self._CHANNEL_SCHEDULE[:n_ups]
+        ups = []
+        in_ch = emb_dim
+        for out_ch in channel_sizes:
+            ups.append(nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2))
+            in_ch = out_ch
+
+        self.ups        = nn.ModuleList(ups)
+        self.final_proj = nn.Conv2d(in_ch, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x):
         # x: (B, num_patches, emb_dim)
-        x    = x.transpose(1, 2)                    # (B, emb_dim, num_patches)
+        x    = x.transpose(1, 2)                 # (B, emb_dim, num_patches)
         grid = int(x.shape[2] ** 0.5)
-        x    = x.unflatten(2, (grid, grid))          # (B, emb_dim, G, G)
-        x    = F.elu(self.up1(x))
-        x    = F.elu(self.up2(x))
-        x    = F.elu(self.up3(x))
-        x    = F.elu(self.up4(x))
-        return self.final_proj(x)                    # (B, out_channels, H, W)
+        x    = x.unflatten(2, (grid, grid))       # (B, emb_dim, G, G)
+        for up in self.ups:
+            x = F.elu(up(x))
+        return self.final_proj(x)                # (B, out_channels, H, W)
