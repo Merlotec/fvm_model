@@ -60,7 +60,7 @@ WINDOW_SIZE = _HP['window_size']
 NUM_LAYERS  = _HP['num_layers']
 FIRST_FRAME = _HP['first_frame']
 
-from train import DATASET_DIR, build_renderer
+from helper import DATASET_DIR, build_renderer
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 
