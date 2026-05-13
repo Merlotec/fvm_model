@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from temporal_patch import TemporalPatchEmbedding
 from axial_transformer import FluidAxialTransformer
-from cnn_decoder import CNNDecoder
+from linear_decoder import LinearDecoder
 
 
 class FluidVisionModel(nn.Module):
@@ -18,7 +18,7 @@ class FluidVisionModel(nn.Module):
         self.patch_embed = TemporalPatchEmbedding(num_channels, num_obs, patch_size, emb_dim)
         self.transformer = FluidAxialTransformer(emb_dim, grid_size=grid_size,
                                                  num_obs=num_obs, num_layers=num_layers)
-        self.decoder     = CNNDecoder(emb_dim, num_channels, patch_size)
+        self.decoder     = LinearDecoder(emb_dim, num_channels, patch_size, grid_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, C, H, W)
