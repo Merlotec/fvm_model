@@ -7,26 +7,15 @@ where patches within each frame are row-major (row 0 col 0, row 0 col 1, ...).
 Each layer applies three focused attention operations then a FFN:
   - Row attention:      each token attends over the G tokens in its row (same frame, same row)
   - Column attention:   each token attends over the G tokens in its column (same frame, same col)
-  - Temporal attention: each token attends causally over a window of num_obs past timesteps at
-                        its spatial position. T is derived from the actual input length so the
-                        transformer generalises to any sequence length at train and inference time.
-                        Uses flex_attention on CUDA; falls back to SDPA + manual mask elsewhere.
+  - Temporal attention: each token attends over all num_obs timesteps at its spatial position
+                        (full attention, no masking — temporal position encoded by TemporalPatchEmbedding)
 
-1D RoPE is applied to all three axes (row, col, temporal) so position is always
-encoded as a relative offset in the attention dot product rather than an absolute index.
+1D RoPE is applied to the spatial (row, col) axes for relative position encoding.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-try:
-    from torch.nn.attention.flex_attention import flex_attention
-    _FLEX_AVAILABLE = True
-except ImportError:
-    _FLEX_AVAILABLE = False
-
-_TEMPORAL_ROPE_MAX = 4096   # maximum supported sequence length for temporal RoPE
 
 
 def _build_rope_buffers(seq_len: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -49,38 +38,15 @@ def _apply_rope(q, k, cos, sin):
     return q, k
 
 
-def _make_causal_window_score_mod(window: int):
-    """
-    Returns a score_mod for flex_attention: causal + sliding window of `window` steps.
-    Position k is attended by q only when  k <= q  and  q - k < window.
-    """
-    def score_mod(score, b, h, q_idx, k_idx):
-        causal = k_idx <= q_idx
-        within = (q_idx - k_idx) < window
-        return torch.where(causal & within, score, score.new_full((), float('-inf')))
-    return score_mod
-
-
-def _causal_window_attn_mask(T: int, window: int, device, dtype) -> torch.Tensor:
-    """(T, T) additive mask for SDPA fallback on non-CUDA devices."""
-    q_idx   = torch.arange(T, device=device).unsqueeze(1)
-    k_idx   = torch.arange(T, device=device).unsqueeze(0)
-    allowed = (k_idx <= q_idx) & ((q_idx - k_idx) < window)
-    return torch.zeros(T, T, device=device, dtype=dtype).masked_fill(~allowed, float('-inf'))
-
-
 class AxisAttention(nn.Module):
     """
-    Single-axis multi-head attention with RoPE on all three axes.
+    Single-axis multi-head attention.
 
-    axis='row'      — attend over the G column positions in the same row and frame
-    axis='col'      — attend over the G row positions in the same column and frame
-    axis='temporal' — causal window attention over T timesteps at each spatial position
-                      (T is inferred from the input at runtime, not fixed at init time)
+    axis='row'      — attend over the G column positions in the same row and frame, with RoPE
+    axis='col'      — attend over the G row positions in the same column and frame, with RoPE
+    axis='temporal' — full attention over all T timesteps at each spatial position
+                      (no mask, no RoPE — temporal position from TemporalPatchEmbedding)
     """
-
-    cos_cache: torch.Tensor
-    sin_cache: torch.Tensor
 
     def __init__(self, emb_dim: int, nhead: int, axis: str,
                  grid_size: int, num_obs: int, dropout: float = 0.1):
@@ -100,12 +66,8 @@ class AxisAttention(nn.Module):
 
         if axis in ('row', 'col'):
             cos, sin = _build_rope_buffers(grid_size, self.head_dim)
-        else:
-            cos, sin = _build_rope_buffers(_TEMPORAL_ROPE_MAX, self.head_dim)
-            self._score_mod = _make_causal_window_score_mod(num_obs)
-
-        self.register_buffer('cos_cache', cos)
-        self.register_buffer('sin_cache', sin)
+            self.register_buffer('cos_cache', cos)
+            self.register_buffer('sin_cache', sin)
 
     def _attend(self, x: torch.Tensor) -> torch.Tensor:
         """x: (groups, seq, D) → (groups, seq, D)."""
@@ -113,28 +75,19 @@ class AxisAttention(nn.Module):
         qkv = self.qkv(x).reshape(BG, L, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)   # (BG, nhead, L, head_dim)
 
-        # RoPE applied on all axes
-        cos = self.cos_cache[:L].unsqueeze(0).unsqueeze(0)   # (1, 1, L, head_dim)
-        sin = self.sin_cache[:L].unsqueeze(0).unsqueeze(0)
-        q, k = _apply_rope(q, k, cos, sin)
+        if self.axis in ('row', 'col'):
+            cos = self.cos_cache[:L].unsqueeze(0).unsqueeze(0)   # (1, 1, L, head_dim)
+            sin = self.sin_cache[:L].unsqueeze(0).unsqueeze(0)
+            q, k = _apply_rope(q, k, cos, sin)
 
-        if self.axis != 'temporal':
-            out = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=self.dropout_p if self.training else 0.0
-            )
-        elif _FLEX_AVAILABLE and q.device.type == 'cuda':
-            out = flex_attention(q, k, v, score_mod=self._score_mod)
-        else:
-            mask = _causal_window_attn_mask(L, self.num_obs, q.device, q.dtype)
-            out  = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
-            )
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout_p if self.training else 0.0
+        )
 
         return self.out_proj(out.transpose(1, 2).reshape(BG, L, D))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T*G*G, D) — T is inferred from the input, not from self.num_obs
+        # x: (B, T*G*G, D)
         B, S, D = x.shape
         G = self.grid_size
         T = S // (G * G)

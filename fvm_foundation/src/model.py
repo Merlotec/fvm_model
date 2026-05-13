@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from temporal_patch import TemporalPatchEmbedding
 from axial_transformer import FluidAxialTransformer
-from linear_overflow_decoder import LinearOverflowDecoder
+from cnn_decoder import CNNDecoder
 
 
 class FluidVisionModel(nn.Module):
@@ -15,16 +15,15 @@ class FluidVisionModel(nn.Module):
         assert grid_size * grid_size == num_patches, "num_patches must be a perfect square"
 
         self.num_patches = num_patches
-        self.patch_embed = TemporalPatchEmbedding(num_channels, patch_size, emb_dim)
+        self.patch_embed = TemporalPatchEmbedding(num_channels, num_obs, patch_size, emb_dim)
         self.transformer = FluidAxialTransformer(emb_dim, grid_size=grid_size,
                                                  num_obs=num_obs, num_layers=num_layers)
-        self.decoder     = LinearOverflowDecoder(emb_dim, num_channels, patch_size, grid_size)
+        self.decoder     = CNNDecoder(emb_dim, num_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, C, H, W)
-        B, T = x.shape[:2]
+        B = x.shape[0]
         x = self.patch_embed(x)                                    # (B, T*num_patches, emb_dim)
         x = self.transformer(x)                                    # (B, T*num_patches, emb_dim)
-        x = x.reshape(B * T, self.num_patches, x.shape[-1])       # (B*T, num_patches, emb_dim)
-        x = self.decoder(x)                                        # (B*T, num_channels, H, W)
-        return x.reshape(B, T, *x.shape[1:])                      # (B, T, num_channels, H, W)
+        x = x[:, -self.num_patches:, :]                            # last frame only: (B, num_patches, emb_dim)
+        return self.decoder(x)                                     # (B, num_channels, H, W)

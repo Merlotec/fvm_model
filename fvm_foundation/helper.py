@@ -30,7 +30,6 @@ N_CHANNELS  = _HP['n_channels']
 WINDOW_SIZE = _HP['window_size']
 NUM_LAYERS  = _HP['num_layers']
 FIRST_FRAME = _HP['first_frame']
-SEQ_LEN     = _HP['seq_len']
 
 DELTA_STATS_PATH = Path(__file__).resolve().parent / 'delta_stats.json'
 INPUT_STATS_PATH = Path(__file__).resolve().parent / 'input_stats.json'

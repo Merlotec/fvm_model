@@ -6,7 +6,7 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from cprint import c_print
 
-from helper import _HP, DATASET_DIR, SEQ_LEN
+from helper import _HP, DATASET_DIR
 from data import FVMDataModule
 from lightning_model import FVMLightningModel
 
@@ -24,8 +24,6 @@ def main():
     parser.add_argument('--num-nodes',   type=int,   default=_HP['num_nodes'])
     parser.add_argument('--precision',   type=str,   default=_HP['precision'],
                         help='Training precision: 32, 16-mixed, bf16-mixed')
-    parser.add_argument('--seq-len',     type=int,   default=SEQ_LEN,
-                        help='Frames per training chunk (model sees full sequence causally)')
     parser.add_argument('--resume',      type=Path,  default=None,
                         help='Path to a Lightning checkpoint to resume from')
     args = parser.parse_args()
@@ -42,7 +40,7 @@ def main():
     )
 
     datamodule      = FVMDataModule(data_dir=args.data_dir, batch_size=args.batch_size,
-                                    num_workers=args.num_workers, seq_len=args.seq_len)
+                                    num_workers=args.num_workers)
     lightning_model = FVMLightningModel(lr=args.lr)
 
     trainer = L.Trainer(

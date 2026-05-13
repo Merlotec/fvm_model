@@ -76,18 +76,18 @@ class FVMLightningModel(L.LightningModule):
         self._epoch_errs: list[torch.Tensor] = []
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        frames, targets = batch                                    # (B, T, C, H, W) each
-        pred            = self(frames)                             # (B, T, C, H, W) norm delta
-        target_norm     = (targets - self.delta_mean) / self.delta_std
+        window, target = batch                                     # (B, T, C, H, W), (B, C, H, W)
+        pred           = self(window)                              # (B, C, H, W) norm delta
+        target_norm    = (target - self.delta_mean) / self.delta_std
 
-        # pixel_mask is (1,1,H,W) — unsqueeze to (1,1,1,H,W) to broadcast over B,T,C
-        valid = self.pixel_mask.unsqueeze(0).expand_as(target_norm)
+        # pixel_mask is (1,1,H,W) — broadcasts over (B,C,H,W)
+        valid = self.pixel_mask.expand_as(target_norm)
         err   = (pred - target_norm)[valid]
         loss  = err.pow(2).mean() + err.abs().mean()
 
         pred_denorm = self.denormalise(pred)
-        rel_err = ((targets - pred_denorm).abs()[valid] /
-                   targets.abs()[valid].clamp(min=1e-6)).mean()
+        rel_err = ((target - pred_denorm).abs()[valid] /
+                   target.abs()[valid].clamp(min=1e-6)).mean()
 
         self._epoch_errs.append(err.detach().cpu())
 

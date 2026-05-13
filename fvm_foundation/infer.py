@@ -237,7 +237,7 @@ def run_inference(
         for step in range(n_steps):
             inp = _normalise_window(window)
 
-            raw_delta = model(inp).squeeze(0)[-1]         # (N_CHANNELS, H, W) — last timestep
+            raw_delta = model(inp).squeeze(0)              # (N_CHANNELS, H, W)
             if pixel_mask is not None:
                 _mask = pixel_mask.squeeze(0)             # (1, H, W) — broadcasts over (C, H, W)
                 raw_delta = raw_delta * _mask
