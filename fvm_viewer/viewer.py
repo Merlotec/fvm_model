@@ -377,12 +377,9 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     gen_run_dirs  = [gen_by_name[n]  for n in run_names]
 
     print(f"Found {len(run_names)} common run(s): {run_names}")
-    print("Precomputing renderers for real data...")
-    renderers:      dict[str, MeshRenderer] = {d: build_renderer(d, render_res) for d in real_run_dirs}
-    real_files_map: dict[str, list[str]]    = {d: find_timestep_files(d) for d in real_run_dirs}
-    gen_files_map:  dict[str, list[str]]    = {d: find_timestep_files(d) for d in gen_run_dirs}
 
     # Detect render resolution from the first available gen frame; fall back to RESOLUTION
+    gen_files_map:  dict[str, list[str]]    = {d: find_timestep_files(d) for d in gen_run_dirs}
     render_res = RESOLUTION
     for _gd in gen_run_dirs:
         _files = gen_files_map.get(_gd, [])
@@ -395,6 +392,9 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
                 pass
             break
 
+    print("Precomputing renderers for real data...")
+    renderers:      dict[str, MeshRenderer] = {d: build_renderer(d, render_res) for d in real_run_dirs}
+    real_files_map: dict[str, list[str]]    = {d: find_timestep_files(d) for d in real_run_dirs}
     print("Ready.")
 
     app  = dash.Dash(__name__, title="FVM Viewer — Compare")
