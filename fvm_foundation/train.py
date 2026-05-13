@@ -6,7 +6,7 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from cprint import c_print
 
-from helper import _HP, DATASET_DIR
+from helper import _HP, DATASET_DIR, NOISE_STD
 from data import FVMDataModule
 from lightning_model import FVMLightningModel
 
@@ -24,6 +24,8 @@ def main():
     parser.add_argument('--num-nodes',   type=int,   default=_HP['num_nodes'])
     parser.add_argument('--precision',   type=str,   default=_HP['precision'],
                         help='Training precision: 32, 16-mixed, bf16-mixed')
+    parser.add_argument('--noise-std',   type=float, default=NOISE_STD,
+                        help='Std of Gaussian noise added to normalised inputs during training (default: 0.05)')
     parser.add_argument('--resume',      type=Path,  default=None,
                         help='Path to a Lightning checkpoint to resume from')
     args = parser.parse_args()
@@ -41,7 +43,7 @@ def main():
 
     datamodule      = FVMDataModule(data_dir=args.data_dir, batch_size=args.batch_size,
                                     num_workers=args.num_workers)
-    lightning_model = FVMLightningModel(lr=args.lr)
+    lightning_model = FVMLightningModel(lr=args.lr, noise_std=args.noise_std)
 
     trainer = L.Trainer(
         max_epochs        = args.epochs,

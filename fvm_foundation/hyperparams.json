@@ -12,6 +12,7 @@
     "num_nodes": 1,
     "precision": "bf16-mixed",
     "num_layers": 8,
-    "first_frame": 20
+    "first_frame": 20,
+    "noise_std": 0.05
 }
 

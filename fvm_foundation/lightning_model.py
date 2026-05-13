@@ -16,7 +16,7 @@ from helper import (
 
 
 class FVMLightningModel(L.LightningModule):
-    def __init__(self, lr: float = 1e-4):
+    def __init__(self, lr: float = 1e-4, noise_std: float = 0.05):
         super().__init__()
         self.save_hyperparameters()
         H, W        = RESOLUTION
@@ -73,7 +73,10 @@ class FVMLightningModel(L.LightningModule):
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         window, target = batch                                     # (B, T, C, H, W), (B, C, H, W)
-        pred           = self(window)                              # (B, C, H, W) norm delta
+        window_norm = self._normalise_window(window)
+        if self.hparams.noise_std > 0:
+            window_norm = window_norm + torch.randn_like(window_norm) * self.hparams.noise_std
+        pred = self.model(window_norm) * self.pixel_mask           # (B, C, H, W) norm delta
         target_norm    = (target - self.delta_mean) / self.delta_std
 
         # pixel_mask is (1,1,H,W) — broadcasts over (B,C,H,W)
