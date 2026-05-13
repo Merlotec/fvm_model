@@ -239,11 +239,12 @@ def run_inference(
 
             raw_delta = model(inp).squeeze(0)[-1]         # (N_CHANNELS, H, W) — last timestep
             if pixel_mask is not None:
-                raw_delta = raw_delta * pixel_mask        # zero non-fluid pixels before denorm
+                _mask = pixel_mask.squeeze(0)             # (1, H, W) — broadcasts over (C, H, W)
+                raw_delta = raw_delta * _mask
             delta = raw_delta * delta_std + delta_mean if delta_mean is not None else raw_delta
             pred  = window[-1] + delta
             if pixel_mask is not None:
-                pred = pred * pixel_mask                  # zero any accumulated values at holes
+                pred = pred * _mask                       # zero any accumulated values at holes
 
             _save_frame(out_dir, t_next, pred.cpu().numpy(), is_seed=False)
             c_print(f'  pred  t={t_next:.4g}  [{step + 1}/{n_steps}]  raw={raw_delta.abs().mean():.4f}  delta={delta.abs().mean():.4f}', color='bright_green')
