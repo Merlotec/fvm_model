@@ -60,7 +60,7 @@ WINDOW_SIZE = _HP['window_size']
 NUM_LAYERS  = _HP['num_layers']
 FIRST_FRAME = _HP['first_frame']
 
-from helper import DATASET_DIR, build_renderer
+from helper import DATASET_DIR, build_renderer, PIXEL_MASK_PATH
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 
@@ -140,10 +140,11 @@ def run_inference(
 
     # Extract normalisation buffers saved on the Lightning module before
     # loading into FluidVisionModel (which doesn't have these buffers itself).
-    ckpt_delta_mean = state.pop('delta_mean', None)
-    ckpt_delta_std  = state.pop('delta_std',  None)
-    ckpt_input_mean = state.pop('input_mean', None)
-    ckpt_input_std  = state.pop('input_std',  None)
+    ckpt_delta_mean = state.pop('delta_mean',  None)
+    ckpt_delta_std  = state.pop('delta_std',   None)
+    ckpt_input_mean = state.pop('input_mean',  None)
+    ckpt_input_std  = state.pop('input_std',   None)
+    ckpt_pixel_mask = state.pop('pixel_mask',  None)
 
     result = model.load_state_dict(state, strict=False)
     if result.missing_keys:
@@ -172,6 +173,16 @@ def run_inference(
                                        _DELTA_STATS_PATH, 'delta normalisation')
     input_mean, input_std = _load_pair(ckpt_input_mean, ckpt_input_std,
                                        _INPUT_STATS_PATH, 'input normalisation')
+
+    if ckpt_pixel_mask is not None:
+        pixel_mask = ckpt_pixel_mask.to(device)   # (1, 1, H, W) bool
+        c_print(f'Loaded pixel mask from checkpoint — {pixel_mask.sum().item()} fluid pixels', color='green')
+    elif PIXEL_MASK_PATH.exists():
+        pixel_mask = torch.load(PIXEL_MASK_PATH, map_location=device)
+        c_print(f'Loaded pixel mask from {PIXEL_MASK_PATH.name} (fallback)', color='yellow')
+    else:
+        pixel_mask = None
+        c_print('Warning: no pixel mask found — non-fluid pixels will not be zeroed', color='yellow')
 
     # ---- input files ----
     all_files = _find_timestep_files(sim_dir)
@@ -227,8 +238,12 @@ def run_inference(
             inp = _normalise_window(window)
 
             raw_delta = model(inp).squeeze(0)[-1]         # (N_CHANNELS, H, W) — last timestep
+            if pixel_mask is not None:
+                raw_delta = raw_delta * pixel_mask        # zero non-fluid pixels before denorm
             delta = raw_delta * delta_std + delta_mean if delta_mean is not None else raw_delta
             pred  = window[-1] + delta
+            if pixel_mask is not None:
+                pred = pred * pixel_mask                  # zero any accumulated values at holes
 
             _save_frame(out_dir, t_next, pred.cpu().numpy(), is_seed=False)
             c_print(f'  pred  t={t_next:.4g}  [{step + 1}/{n_steps}]  raw={raw_delta.abs().mean():.4f}  delta={delta.abs().mean():.4f}', color='bright_green')

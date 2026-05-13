@@ -30,6 +30,7 @@ class SweepConfig:
     mu_b_values: list[float] | None = None
 
     save_t: float = 0.1
+    n_iter: int = 5000
 
     # e.g. {"viscosity": 2e-3, "gamma": 1.4}
     phys_overrides: dict[str, Any] = field(default_factory=dict)
