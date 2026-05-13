@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'src'))
 from model import FluidVisionModel
 
 from helper import (
-    print_histogram,
     RESOLUTION, PATCH_SIZE, EMB_DIM, N_CHANNELS, WINDOW_SIZE, NUM_LAYERS,
     DELTA_STATS_PATH, INPUT_STATS_PATH, PIXEL_MASK_PATH,
 )
@@ -72,9 +71,6 @@ class FVMLightningModel(L.LightningModule):
         else:
             c_print('Warning: pixel_mask.pt not found — all pixels treated as fluid', color='yellow')
 
-    def on_train_epoch_start(self) -> None:
-        self._epoch_errs: list[torch.Tensor] = []
-
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         window, target = batch                                     # (B, T, C, H, W), (B, C, H, W)
         pred           = self(window)                              # (B, C, H, W) norm delta
@@ -89,17 +85,9 @@ class FVMLightningModel(L.LightningModule):
         rel_err = ((target - pred_denorm).abs()[valid] /
                    target.abs()[valid].clamp(min=1e-6)).mean()
 
-        self._epoch_errs.append(err.detach().cpu())
-
         self.log('train_loss', loss,    on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('rel_err',    rel_err, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
-
-    def on_train_epoch_end(self) -> None:
-        if self.global_rank == 0 and self._epoch_errs:
-            all_errs = torch.cat(self._epoch_errs)
-            print_histogram(all_errs, title=f'Epoch {self.current_epoch} error distribution')
-        self._epoch_errs = []
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
