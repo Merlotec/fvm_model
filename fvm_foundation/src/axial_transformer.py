@@ -80,8 +80,9 @@ class AxisAttention(nn.Module):
             sin = self.sin_cache[:L].unsqueeze(0).unsqueeze(0)
             q, k = _apply_rope(q, k, cos, sin)
 
+        is_causal = self.axis == 'temporal'
         out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout_p if self.training else 0.0
+            q, k, v, is_causal=is_causal, dropout_p=self.dropout_p if self.training else 0.0
         )
 
         return self.out_proj(out.transpose(1, 2).reshape(BG, L, D))
