@@ -1,26 +1,49 @@
 """
-Hierarchical Latent Fluid Simulation Model.
+Multi-Level Same-Resolution Fluid Prediction Model.
 
-Architecture:
-  1. PatchEmbed        — (B,C,H,W) → (B,P,d) image patch tokens
-  2. CrossAttnEncoder  — N learned query tokens cross-attend to patch tokens
-                         → (B,N,d) latent tokens  [tokens are independent: no latent self-attn]
-  3. HierarchicalTransformer — self-attention over latent with block-causal mask
-                         → (B,N,d) predicted next-state latent
-  4. LatentDecoder     — predicted latent cross-attended to by patch queries → (B,C,H,W)
+Architecture
+------------
+K levels, each with P = (img_size/patch_size)^2 patch tokens covering the
+full image at the same spatial resolution.
 
-Token hierarchy:
-  Group 0  : tokens [0, n_base)           — always active, encode most critical info
-  Group k≥1: tokens [n_base+(k-1)*s, n_base+k*s) — progressively finer detail
+  1. PatchEmbed (shared)  — (B,T*C,H,W) → (B,P,d) base spatial features.
+  2. Level embedding      — each level gets base features + a different learned
+                            offset (n_levels, d), so the transformer can tell
+                            which level each token belongs to.
+  3. HierarchicalTransformer — (B,K*P,d) with level-causal mask:
+                            level k can attend to levels 0..k only.
+                            This enforces that level 0 must predict well alone,
+                            level 1 can refine using level 0's full-image context,
+                            and so on.
+  4. GateNetwork          — after each level, a lightweight MLP produces a
+                            per-position importance score in (0,1).
+                            Effective weight at level k = product of gates 0..k-1
+                            (cascade: dropping a position at level j also drops it
+                            at all higher levels).
+  5. PerLevelDecoder      — each level k has its own linear head d → C·p².
+                            Final patch = Σ_k gate_weight[k,p] · head_k(out[k,p]).
+                            Level 0 always contributes (weight=1); higher levels
+                            contribute proportionally to their cascade gate score.
+                            At hard-gate inference, zero-gated levels are free to skip.
 
-Causal mask: group k can attend to groups 0..k; earlier groups cannot attend to later ones.
-This enables KV-caching: group-0 KV is computed once and reused for all subsequent groups.
+Training
+--------
+  Phase 1 (curriculum): n_active_levels steps from 1 → K, adding one level
+  every N optimiser steps.  With 1 level the model is just a standard ViT-like
+  patch predictor; each new level is a learned refinement layer.
 
-Training phases:
-  Phase 1 — Curriculum: start with n_base tokens, expand by step_size every N steps.
-  Phase 2 — Value learning: freeze backbone, train value_head to predict per-group
-             marginal loss decrease (L_{k-1} - L_k). Each latent token in group k is
-             supervised to produce its group's marginal improvement.
+  Loss = reconstruction (MSE+L1) + sparsity_weight * (mean_active - gate_budget)²
+  The sparsity term targets a chosen fraction of level-1+ tokens being active,
+  rather than driving all gates to zero.
+
+Inference
+---------
+  Soft (training-compatible): all K*P tokens present, gate scores applied as
+  value weights in the decoder.
+
+  Sparse (efficient): run levels sequentially, caching each level's KV.  After
+  each level apply hard gate threshold; only surviving positions advance.  The
+  level-causal mask ensures this is identical to the full-K forward pass.
 """
 
 import torch
@@ -30,11 +53,11 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Building blocks
+# Shared building blocks (unchanged from previous version)
 # ---------------------------------------------------------------------------
 
 class PatchEmbed(nn.Module):
-    """Conv2d patch projection + learned 1-D positional embedding."""
+    """Conv2d patch projection + learned spatial positional embedding."""
 
     def __init__(self, img_size: int, patch_size: int, in_channels: int, d_model: int):
         super().__init__()
@@ -45,7 +68,6 @@ class PatchEmbed(nn.Module):
         self.pos  = nn.Parameter(torch.randn(1, self.n_patches, d_model) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W) → (B, P, d)
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x + self.pos
 
@@ -54,56 +76,15 @@ class FFN(nn.Module):
     def __init__(self, d: int, expansion: int = 4, dropout: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d, d * expansion),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d * expansion, d),
-            nn.Dropout(dropout),
+            nn.Linear(d, d * expansion), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d * expansion, d), nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-class CrossAttnLayer(nn.Module):
-    """
-    One cross-attention layer: latent queries independently attend to context.
-
-    Intentionally has NO self-attention between latent tokens, so that
-    latent[i] depends only on query_tokens[i] and the image context.
-    This independence lets Phase-2 evaluation slice the latent safely.
-    """
-
-    def __init__(self, d: int, n_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.attn    = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
-        self.ffn     = FFN(d, dropout=dropout)
-        self.norm_q  = nn.LayerNorm(d)
-        self.norm_kv = nn.LayerNorm(d)
-        self.norm_ff = nn.LayerNorm(d)
-
-    def forward(self, latent: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        nkv = self.norm_kv(ctx)
-        x   = latent + self.attn(self.norm_q(latent), nkv, nkv)[0]
-        return x + self.ffn(self.norm_ff(x))
-
-
-class CrossAttnEncoder(nn.Module):
-    """Stack of CrossAttnLayers: (B,N,d) queries + (B,P,d) image → (B,N,d) latent."""
-
-    def __init__(self, d: int, n_heads: int, n_layers: int, dropout: float = 0.0):
-        super().__init__()
-        self.layers = nn.ModuleList([CrossAttnLayer(d, n_heads, dropout) for _ in range(n_layers)])
-
-    def forward(self, latent: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            latent = layer(latent, ctx)
-        return latent
-
-
 class SelfAttnLayer(nn.Module):
-    """Pre-norm transformer block with optional additive attention mask."""
-
     def __init__(self, d: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
         self.attn  = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
@@ -118,14 +99,6 @@ class SelfAttnLayer(nn.Module):
 
 
 class HierarchicalTransformer(nn.Module):
-    """
-    Standard transformer whose attention is shaped by a block-causal mask.
-
-    The mask enforces: group k sees groups 0..k but NOT k+1, k+2, ...
-    This is equivalent to causal attention where the "time axis" is the
-    token-group hierarchy instead of sequence position.
-    """
-
     def __init__(self, d: int, n_heads: int, n_layers: int, dropout: float = 0.0):
         super().__init__()
         self.layers = nn.ModuleList([SelfAttnLayer(d, n_heads, dropout) for _ in range(n_layers)])
@@ -136,46 +109,54 @@ class HierarchicalTransformer(nn.Module):
         return x
 
 
-class LatentDecoder(nn.Module):
+class PerLevelDecoder(nn.Module):
     """
-    Decode N latent tokens → (B, C, H, W) via one cross-attention layer.
+    Per-level linear decode + gated residual sum.
 
-    Learned patch queries attend to all N latent tokens, then each patch
-    token is projected to its C*p*p pixel block and the blocks are tiled.
-    Handles any N naturally (cross-attention is flexible in key/value length).
+    Each level k has its own projection head (LayerNorm → Linear, d → C·p²).
+    The final patch pixel values are:
+
+        output[p] = Σ_k  gate_weight[k, p] · head_k(transformer_out[k, p])
+
+    Level 0 always has gate_weight=1.0, so it provides the base prediction.
+    Each subsequent level adds a gated residual correction at each position.
+    Positions with near-zero cumulative gate weight contribute nothing, making
+    it trivial to skip those levels at sparse-inference time.
     """
 
     def __init__(
-        self, d: int, out_channels: int, img_size: int, patch_size: int,
-        n_heads: int, dropout: float = 0.0,
+        self, d: int, out_channels: int, img_size: int, patch_size: int, n_levels: int,
     ):
         super().__init__()
-        n  = img_size // patch_size
+        n = img_size // patch_size
         self.n_per_side   = n
+        self.n_patches    = n * n
         self.patch_size   = patch_size
         self.out_channels = out_channels
 
-        self.patch_q = nn.Parameter(torch.randn(1, n * n, d) * 0.02)
-        self.attn    = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
-        self.ffn     = FFN(d, dropout=dropout)
-        self.norm_q  = nn.LayerNorm(d)
-        self.norm_kv = nn.LayerNorm(d)
-        self.norm_ff = nn.LayerNorm(d)
-        self.proj    = nn.Linear(d, out_channels * patch_size * patch_size)
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(d),
+                nn.Linear(d, out_channels * patch_size * patch_size),
+            )
+            for _ in range(n_levels)
+        ])
 
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        B   = latent.size(0)
-        q   = self.patch_q.expand(B, -1, -1)
-        nkv = self.norm_kv(latent)
-        x   = q + self.attn(self.norm_q(q), nkv, nkv)[0]
-        x   = x + self.ffn(self.norm_ff(x))                      # (B, P, d)
+    def forward(self, transformer_out: torch.Tensor, gate_weights: torch.Tensor) -> torch.Tensor:
+        # transformer_out: (B, n_levels*P, d)
+        # gate_weights:    (B, n_levels*P)  — level 0 slice is all 1s
+        B        = transformer_out.size(0)
+        P        = self.n_patches
+        C, p, n  = self.out_channels, self.patch_size, self.n_per_side
+        n_levels = transformer_out.size(1) // P
 
-        # Fold patch pixels into image layout
-        patches = self.proj(x)                                    # (B, P, C*p*p)
-        p, C, n = self.patch_size, self.out_channels, self.n_per_side
-        img = patches.view(B, n, n, C, p, p)
-        img = img.permute(0, 3, 1, 4, 2, 5).reshape(B, C, n * p, n * p)
-        return img
+        patches = transformer_out.new_zeros(B, P, C * p * p)
+        for k in range(n_levels):
+            tok = transformer_out[:, k * P : (k + 1) * P]            # (B, P, d)
+            w   = gate_weights[:, k * P : (k + 1) * P].unsqueeze(-1) # (B, P, 1)
+            patches = patches + w * self.heads[k](tok)
+
+        return patches.view(B, n, n, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, n * p, n * p)
 
 
 # ---------------------------------------------------------------------------
@@ -183,60 +164,80 @@ class LatentDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_hierarchical_mask(
-    n_tokens: int,
-    n_base: int,
-    step_size: int,
+    n_tokens: int, n_base: int, step_size: int,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
-    Build an additive attention mask enforcing the group-causal hierarchy.
+    Additive attention mask: 0 = may attend, -inf = blocked.
 
-    Group assignment:
-      Group 0  : tokens [0, n_base)
-      Group k≥1: tokens [n_base + (k-1)*step_size, n_base + k*step_size)
+    Group 0  : tokens [0, n_base)
+    Group k≥1: tokens [n_base + (k-1)*step_size, n_base + k*step_size)
 
-    Entry (i, j):  0.0   → token i may attend to token j
-                   -inf  → token i may NOT attend to token j
-
-    Invariant: group(i) >= group(j)  ⟺  i may attend to j.
-    Within the same group: full bidirectional attention.
-    Across groups: only downstream-to-upstream (later → earlier) attention.
+    Token i may attend to token j iff group(i) >= group(j).
     """
     groups = torch.zeros(n_tokens, dtype=torch.long)
     if n_tokens > n_base and step_size > 0:
-        extra = torch.arange(n_tokens - n_base)
-        groups[n_base:] = extra // step_size + 1
+        groups[n_base:] = torch.arange(n_tokens - n_base) // step_size + 1
 
-    can_attend = groups.unsqueeze(1) >= groups.unsqueeze(0)       # (N, N) bool
+    can_attend = groups.unsqueeze(1) >= groups.unsqueeze(0)
     mask = torch.full((n_tokens, n_tokens), float('-inf'))
     mask[can_attend] = 0.0
-
     return mask if device is None else mask.to(device)
+
+
+# ---------------------------------------------------------------------------
+# Gate network
+# ---------------------------------------------------------------------------
+
+class GateNetwork(nn.Module):
+    """
+    Per-position importance gate.
+
+    Takes level-k transformer output (B, P, d) → scalar score per position (B, P)
+    in (0, 1).  A score near 0 means "level k+1 is not needed at this position";
+    near 1 means "keep refining here."
+
+    The gate reads the FULL transformer output at level k, which includes
+    attended context from all levels 0..k.  This gives the gate the richest
+    possible signal for deciding whether further refinement is worthwhile.
+    """
+
+    def __init__(self, d: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, d // 4),
+            nn.GELU(),
+            nn.Linear(d // 4, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)   # (B, P)
 
 
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
 
-class HierarchicalLatentModel(nn.Module):
+class MultiLevelFluidModel(nn.Module):
     """
-    Hierarchical Latent Fluid Simulation Model.
+    Multi-Level Same-Resolution Fluid Prediction Model.
 
     Args:
-        img_size:            Spatial resolution (assumed square).
-        patch_size:          Patch size (must divide img_size).
-        in_channels:         Per-frame channels (e.g. 4 for Vx,Vy,rho,T).
-        window_size:         Number of temporal frames concatenated as input (T).
-                             The patch embedder sees in_channels*window_size channels.
-                             Output is always in_channels (single-frame delta).
-        n_base:              Base token count — always active (default 100).
-        step_size:           Tokens added per curriculum stage (s).
-        n_steps:             Number of additional stages (total = n_base + n_steps*step_size).
-        d_model:             Embedding dimension.
-        n_heads:             Attention heads.
-        n_encoder_layers:    Cross-attention encoder depth.
-        n_transformer_layers: Hierarchical transformer depth.
-        dropout:             Dropout probability.
+        img_size:             Spatial resolution (square).
+        patch_size:           Patch size (must divide img_size).
+        in_channels:          Per-frame channels (e.g. 4 for Vx,Vy,rho,T).
+        window_size:          Temporal frames stacked as input (T).
+        n_levels:             Number of refinement levels (K).
+        d_model:              Token embedding dimension.
+        n_heads:              Attention heads.
+        n_transformer_layers: Transformer depth.
+        gate_threshold:       Hard gate cutoff at inference (default 0.5).
+        gate_budget:          Target fraction of level-1+ tokens to keep during
+                              training (default 0.4).  The sparsity loss drives
+                              mean gate weight toward this target rather than 0.
+        dropout:              Dropout probability.
     """
 
     def __init__(
@@ -244,39 +245,37 @@ class HierarchicalLatentModel(nn.Module):
         img_size: int             = 512,
         patch_size: int           = 32,
         in_channels: int          = 4,
-        window_size: int          = 1,
-        n_base: int               = 100,
-        step_size: int            = 10,
-        n_steps: int              = 10,
+        window_size: int          = 5,
+        n_levels: int             = 5,
         d_model: int              = 512,
         n_heads: int              = 8,
-        n_encoder_layers: int     = 3,
         n_transformer_layers: int = 6,
+        gate_threshold: float     = 0.5,
+        gate_budget: float        = 0.4,
         dropout: float            = 0.0,
     ):
         super().__init__()
-        self.n_base        = n_base
-        self.step_size     = step_size
-        self.n_steps       = n_steps
-        self.total_tokens  = n_base + n_steps * step_size
+        P = (img_size // patch_size) ** 2
+        self.n_patches     = P
+        self.n_levels      = n_levels
+        self.gate_threshold = gate_threshold
+        self.gate_budget   = gate_budget
         self.d_model       = d_model
-        self.window_size   = window_size
-        self.in_channels   = in_channels
 
-        # PatchEmbed sees T*C channels; decoder always outputs C (single-frame delta)
+        # Shared patch embedding — sees T*C channels
         self.patch_embed = PatchEmbed(img_size, patch_size, in_channels * window_size, d_model)
 
-        # Learned query tokens — positional index encodes hierarchy
-        self.query_tokens = nn.Parameter(torch.randn(self.total_tokens, d_model) * 0.02)
+        # Level embeddings: distinguish which level each token belongs to
+        self.level_embed = nn.Parameter(torch.randn(n_levels, d_model) * 0.02)
 
-        self.encoder     = CrossAttnEncoder(d_model, n_heads, n_encoder_layers, dropout)
+        # Transformer — the level-causal mask is built per forward pass
         self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, dropout)
-        self.decoder     = LatentDecoder(d_model, in_channels, img_size, patch_size, n_heads, dropout)
 
-        # Phase-2 value head: predicts per-token marginal loss improvement.
-        # Gradient flows through this head back into the latent representation,
-        # so the tokens learn to encode their own value in their embedding.
-        self.value_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
+        # Gate[k]: reads level-k output → importance of level-k+1 at each position
+        self.gates = nn.ModuleList([GateNetwork(d_model) for _ in range(n_levels - 1)])
+
+        # Decoder — one linear head per level, gated residual sum
+        self.decoder = PerLevelDecoder(d_model, in_channels, img_size, patch_size, n_levels)
 
         self._init_weights()
 
@@ -288,117 +287,130 @@ class HierarchicalLatentModel(nn.Module):
                     nn.init.zeros_(m.bias)
 
     # ------------------------------------------------------------------
-    # Grouped token utilities
+    # Gate weight computation
     # ------------------------------------------------------------------
 
-    def group_boundaries(self, n_tokens: int) -> list[int]:
+    def effective_gate_weights(
+        self, transformer_out: torch.Tensor, n_levels: int,
+    ) -> torch.Tensor:
         """
-        Return cumulative token counts at each group boundary.
+        Per-token effective weights, (B, n_levels*P).
 
-        Example (n_base=100, step_size=10, n_tokens=130):
-          → [100, 110, 120, 130]
+          Level 0 : weight = 1.0  (always active, no gate)
+          Level k : weight = gate[0] * gate[1] * ... * gate[k-1]  at each position
+
+        Cascade property: if gate[j][p] ≈ 0 for any j < k, the effective weight
+        at level k and position p collapses to ≈ 0, so position p contributes
+        nothing to the decoder from level k onward.
+
+        Gradients flow correctly through the cumulative product — each gate[j]
+        receives gradient proportional to the product of all other gates times
+        the downstream decoder gradient.
         """
-        bounds = [min(self.n_base, n_tokens)]
-        n = self.n_base
-        while n < n_tokens:
-            n = min(n + self.step_size, n_tokens)
-            if n != bounds[-1]:
-                bounds.append(n)
-        return bounds
+        P  = self.n_patches
+        B  = transformer_out.size(0)
+        dev = transformer_out.device
+        weights = torch.ones(B, n_levels * P, device=dev)
+
+        cumulative = torch.ones(B, P, device=dev)
+        for k in range(n_levels - 1):
+            gate_k     = self.gates[k](transformer_out[:, k * P : (k + 1) * P])  # (B, P)
+            cumulative = cumulative * gate_k
+            weights[:, (k + 1) * P : (k + 2) * P] = cumulative
+
+        return weights   # (B, n_levels*P)
+
+    def active_token_fraction(
+        self, gate_weights: torch.Tensor, n_levels: int,
+    ) -> torch.Tensor:
+        """Mean fraction of level-1+ tokens above the hard gate threshold."""
+        if n_levels == 1:
+            return gate_weights.new_zeros(1).squeeze()
+        P = self.n_patches
+        return (gate_weights[:, P:] > self.gate_threshold).float().mean()
 
     # ------------------------------------------------------------------
-    # Forward components
+    # Forward pass
     # ------------------------------------------------------------------
 
-    def encode(self, x: torch.Tensor, n_tokens: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, n_levels: Optional[int] = None) -> dict:
         """
-        (B,C,H,W) or (B,T,C,H,W) → (B,n_tokens,d) latent tokens.
-
-        Temporal windows are flattened along the channel axis before patch
-        embedding, giving the model access to velocity history without
-        architectural changes to the encoder.
-
-        Each latent token is independent (cross-attn only, no latent self-attn),
-        so latent[:, :k] is identical whether n_tokens=k or n_tokens=N.
-        This property makes Phase-2 group-boundary evaluation cheap.
-        """
-        if x.dim() == 5:                                                     # (B, T, C, H, W)
-            B, T, C, H, W = x.shape
-            x = x.reshape(B, T * C, H, W)
-        B         = x.size(0)
-        patch_tok = self.patch_embed(x)                                      # (B, P, d)
-        q         = self.query_tokens[:n_tokens].unsqueeze(0).expand(B, -1, -1)
-        return self.encoder(q, patch_tok)                                    # (B, N, d)
-
-    def predict(self, latent: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """(B,N,d) latent → (B,N,d) predicted next-state latent."""
-        n = latent.size(1)
-        if mask is None:
-            mask = build_hierarchical_mask(n, self.n_base, self.step_size, latent.device)
-        return self.transformer(latent, mask)
-
-    def decode(self, pred_latent: torch.Tensor) -> torch.Tensor:
-        """(B,N,d) predicted latent → (B,C,H,W) predicted frame delta."""
-        return self.decoder(pred_latent)
-
-    # ------------------------------------------------------------------
-    # Full forward pass
-    # ------------------------------------------------------------------
-
-    def forward(self, x: torch.Tensor, n_tokens: Optional[int] = None) -> dict:
-        """
-        x:        (B, C, H, W) single frame  OR  (B, T, C, H, W) temporal window
-        n_tokens: how many latent tokens to use (curriculum control; defaults to total)
+        x:        (B,C,H,W) or (B,T,C,H,W) normalised input
+        n_levels: active levels for this step (curriculum); defaults to self.n_levels
 
         Returns:
-            pred:        (B, C, H, W) predicted normalised frame delta
-            latent:      (B, N, d)   encoded current-state latent
-            pred_latent: (B, N, d)   predicted next-state latent
+            pred:         (B, C, H, W) predicted normalised frame delta
+            gate_weights: (B, n_levels*P) effective per-token weights
+            sparsity:     scalar — mean weight of level-1+ tokens (target: gate_budget)
+            active_frac:  scalar — hard-threshold fraction active at inference
         """
-        if n_tokens is None:
-            n_tokens = self.total_tokens
+        if n_levels is None:
+            n_levels = self.n_levels
 
-        latent      = self.encode(x, n_tokens)
-        device      = x.device if x.dim() == 4 else x.device
-        mask        = build_hierarchical_mask(n_tokens, self.n_base, self.step_size, device)
-        pred_latent = self.predict(latent, mask)
-        pred        = self.decode(pred_latent)
+        if x.dim() == 5:
+            B, T, C, H, W = x.shape
+            x = x.reshape(B, T * C, H, W)
 
-        return {'pred': pred, 'latent': latent, 'pred_latent': pred_latent}
+        B = x.size(0)
+        P = self.n_patches
+
+        # Base patch features, shared across all levels
+        base = self.patch_embed(x)    # (B, P, d)
+
+        # Stack K copies with different level embeddings
+        tokens = torch.cat(
+            [base + self.level_embed[k] for k in range(n_levels)],
+            dim=1,
+        )                              # (B, K*P, d)
+
+        # Level-causal transformer
+        mask = build_hierarchical_mask(
+            n_levels * P, n_base=P, step_size=P, device=x.device,
+        )
+        out = self.transformer(tokens, mask)   # (B, K*P, d)
+
+        # Gate weights (soft, differentiable)
+        weights = self.effective_gate_weights(out, n_levels)   # (B, K*P)
+
+        # Decode: each level's head weighted by its gate score, summed per position
+        pred = self.decoder(out, weights)                      # (B, C, H, W)
+
+        # Sparsity metrics
+        sparsity    = weights[:, P:].mean() if n_levels > 1 else weights.new_zeros(1).squeeze()
+        active_frac = self.active_token_fraction(weights, n_levels)
+
+        return {
+            'pred':         pred,
+            'gate_weights': weights,
+            'sparsity':     sparsity,
+            'active_frac':  active_frac,
+        }
 
     # ------------------------------------------------------------------
-    # Phase-2 helpers
+    # Inference helpers
     # ------------------------------------------------------------------
 
-    def value_predictions(self, latent: torch.Tensor) -> torch.Tensor:
-        """(B,N,d) → (B,N) per-token value scores."""
-        return self.value_head(latent).squeeze(-1)
-
-    def compute_group_losses(
-        self,
-        latent: torch.Tensor,
-        target_norm: torch.Tensor,
-        pixel_mask: Optional[torch.Tensor],
-    ) -> list[float]:
+    def predict_with_budget(
+        self, x: torch.Tensor, max_active_fraction: float = 0.3,
+    ) -> dict:
         """
-        For each group boundary, run transformer + decoder and compute loss.
-
-        Because latent tokens are independent (no encoder self-attn), slicing
-        latent[:, :n_g] is exact — no re-encoding needed.
-
-        Returns list of scalar losses, one per group boundary.
+        Run full forward pass, then report which positions would be dropped
+        at each level if using max_active_fraction as a budget threshold.
+        Useful for profiling without implementing the sparse kernel.
         """
-        losses = []
-        for n_g in self.group_boundaries(latent.size(1)):
-            mask        = build_hierarchical_mask(n_g, self.n_base, self.step_size, latent.device)
-            pred_latent = self.predict(latent[:, :n_g], mask)
-            pred        = self.decode(pred_latent)
-            losses.append(_recon_loss(pred, target_norm, pixel_mask).item())
-        return losses
+        out = self.forward(x)
+        P   = self.n_patches
+        report = []
+        for k in range(self.n_levels):
+            w      = out['gate_weights'][:, k * P : (k + 1) * P]
+            active = (w > max_active_fraction).float().mean().item()
+            report.append({'level': k, 'mean_weight': w.mean().item(), 'active_frac': active})
+        out['level_report'] = report
+        return out
 
 
 # ---------------------------------------------------------------------------
-# Loss helper (shared between model and lightning wrapper)
+# Loss helper
 # ---------------------------------------------------------------------------
 
 def _recon_loss(
