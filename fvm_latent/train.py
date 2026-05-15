@@ -18,17 +18,21 @@ import lightning as L
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from cprint import c_print
 
-_ROOT     = Path(__file__).resolve().parents[2]
-_FOUND    = _ROOT / 'fvm_model' / 'fvm_foundation'
-_THIS_DIR = Path(__file__).resolve().parent
+_FVM_MODEL = Path(__file__).resolve().parents[1]   # fvm_model/
+_FOUND     = _FVM_MODEL / 'fvm_foundation'
+_THIS_DIR  = Path(__file__).resolve().parent
 
-for _p in (_FOUND, _THIS_DIR):
+# Add fvm_model/ so fvm_latent is importable as a package (not a bare module),
+# and fvm_foundation/ for the data loader. Inserting fvm_model/ first ensures
+# `from fvm_latent.x import` always resolves to our files regardless of what
+# else (e.g. fvm_foundation) is on PYTHONPATH.
+for _p in (_FOUND, _FVM_MODEL):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from data import FVMDataModule                       # type: ignore[import]  noqa: E402
-from model import MultiLevelFluidModel               # type: ignore[import]  noqa: E402
-from lightning_model import (                        # type: ignore[import]  noqa: E402
+from data import FVMDataModule                              # type: ignore[import]  noqa: E402
+from fvm_latent.model import MultiLevelFluidModel           # type: ignore[import]  noqa: E402
+from fvm_latent.lightning_model import (                    # type: ignore[import]  noqa: E402
     Phase1LightningModel,
     CurriculumCallback,
 )
@@ -41,7 +45,7 @@ _HP_PATH = _THIS_DIR / 'hyperparams.json'
 with open(_HP_PATH) as _f:
     _HP = json.load(_f)
 
-DATASET_DIR = _ROOT / 'data' / 'fvm_gen_datasets'
+DATASET_DIR = _FVM_MODEL / 'data' / 'fvm_gen_datasets'
 
 
 def build_model(hp: dict) -> MultiLevelFluidModel:

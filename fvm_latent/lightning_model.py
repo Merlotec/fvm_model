@@ -9,7 +9,6 @@ loss trains the gate networks to keep a chosen budget of tokens active.
 CurriculumCallback steps n_active_levels every `steps_per_stage` optimiser steps.
 """
 
-import sys
 import json
 from pathlib import Path
 
@@ -19,11 +18,7 @@ import lightning as L
 from lightning.pytorch.callbacks import Callback
 from cprint import c_print
 
-_THIS_DIR = Path(__file__).resolve().parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
-
-from model import MultiLevelFluidModel, _recon_loss  # type: ignore[import]  noqa: E402
+from .model import MultiLevelFluidModel, _recon_loss  # noqa: E402
 
 _FOUND           = Path(__file__).resolve().parents[1] / 'fvm_foundation'
 DELTA_STATS_PATH = _FOUND / 'delta_stats.json'
