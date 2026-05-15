@@ -120,13 +120,16 @@ def main() -> None:
     callbacks: list[Callback] = [
         CurriculumCallback(steps_per_stage=args.steps_per_stage),
         ModelCheckpoint(
-            dirpath   = ckpt_dir,
-            filename  = 'model-{epoch:03d}-{val/loss:.5f}',
-            save_last = True,
-            monitor   = 'val/loss',
-            mode      = 'min',
+            dirpath              = ckpt_dir,
+            filename             = 'model-{epoch:03d}-{step:06d}-{train/loss_epoch:.4f}',
+            save_last            = True,
+            every_n_train_steps  = 500,
+            save_top_k           = 3,
+            monitor              = 'train/loss_epoch',
+            mode                 = 'min',
         ),
     ]
+    c_print(f'Checkpoints → {ckpt_dir}', color='cyan')
     c_print(
         f'Curriculum: 1 → {model.n_levels} levels, +1 every {args.steps_per_stage} steps',
         color='bright_green',

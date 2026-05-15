@@ -191,23 +191,6 @@ class Phase1LightningModel(L.LightningModule):
         self.log('train/n_levels',    float(self._n_active_levels))
         return loss
 
-    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        window, target = batch
-        window_n = self._norm_window(window)
-        target_n = self._norm_delta(target)
-
-        # Log loss at each level count so we can see the hierarchy's value
-        for k in range(1, self.model.n_levels + 1):
-            out  = self.model(window_n, n_levels=k)
-            loss = _recon_loss(out['pred'], target_n, self.pixel_mask)
-            self.log(f'val/loss_{k}lvl', loss, sync_dist=True)
-
-        out      = self.model(window_n)
-        val_loss = _recon_loss(out['pred'], target_n, self.pixel_mask)
-        self.log('val/loss',        val_loss,           prog_bar=True, sync_dist=True)
-        self.log('val/sparsity',    out['sparsity'],                   sync_dist=True)
-        self.log('val/active_frac', out['active_frac'],                sync_dist=True)
-        return val_loss
 
     def configure_optimizers(self):  # type: ignore[override]
         lr: float = self.hparams['lr']           # type: ignore[index]
