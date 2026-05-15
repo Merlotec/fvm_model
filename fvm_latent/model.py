@@ -404,6 +404,13 @@ class MultiLevelFluidModel(nn.Module):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # Zero-init the last conv in refine so it starts as identity (output = 0).
+        # Without this, refine(x) ≠ 0 at init and corrupts early reconstruction.
+        last_conv = self.decoder.refine[-1]
+        if isinstance(last_conv, nn.Conv2d):
+            nn.init.zeros_(last_conv.weight)
+            if last_conv.bias is not None:
+                nn.init.zeros_(last_conv.bias)
 
     # ------------------------------------------------------------------
     # Gate weight computation
@@ -415,27 +422,24 @@ class MultiLevelFluidModel(nn.Module):
         """
         Per-token effective weights, (B, n_levels*P).
 
-          Level 0 : weight = 1.0  (always active, no gate)
-          Level k : weight = gate[0] * gate[1] * ... * gate[k-1]  at each position
+          Level 0 : weight = 1.0  (always contributes, no gate)
+          Level k : weight = gates[k-1](transformer_out[k-1])  at each position
 
-        Cascade property: if gate[j][p] ≈ 0 for any j < k, the effective weight
-        at level k and position p collapses to ≈ 0, so position p contributes
-        nothing to the decoder from level k onward.
+        Each level's weight is independent — gate[k-1] reads level-(k-1) output
+        and decides how much level-k's head should contribute to the output.
 
-        Gradients flow correctly through the cumulative product — each gate[j]
-        receives gradient proportional to the product of all other gates times
-        the downstream decoder gradient.
+        Independent gates avoid the cascade gradient problem where level-k heads
+        would otherwise receive gradient ≈ 0.5^k of level-0.  Each head now
+        sees a roughly uniform gradient scale regardless of depth.
         """
-        P  = self.n_patches
-        B  = transformer_out.size(0)
+        P   = self.n_patches
+        B   = transformer_out.size(0)
         dev = transformer_out.device
         weights = torch.ones(B, n_levels * P, device=dev)
 
-        cumulative = torch.ones(B, P, device=dev)
         for k in range(n_levels - 1):
-            gate_k     = self.gates[k](transformer_out[:, k * P : (k + 1) * P])  # (B, P)
-            cumulative = cumulative * gate_k
-            weights[:, (k + 1) * P : (k + 2) * P] = cumulative
+            gate_k = self.gates[k](transformer_out[:, k * P : (k + 1) * P])  # (B, P)
+            weights[:, (k + 1) * P : (k + 2) * P] = gate_k
 
         return weights   # (B, n_levels*P)
 
@@ -485,9 +489,9 @@ class MultiLevelFluidModel(nn.Module):
         # Axial + cross-level mask (cached per n_levels)
         if n_levels not in self._mask_cache:
             self._mask_cache[n_levels] = build_axial_cross_level_mask(
-                n_levels, P, self.n_per_side, device=x.device,
+                n_levels, P, self.n_per_side,
             )
-        mask = self._mask_cache[n_levels]
+        mask = self._mask_cache[n_levels].to(x.device)
         out = self.transformer(tokens, mask, n_levels)   # (B, K*P, d)
 
         # Gate weights (soft, differentiable)
