@@ -10,11 +10,12 @@ full image at the same spatial resolution.
   2. Level embedding      — each level gets base features + a different learned
                             offset (n_levels, d), so the transformer can tell
                             which level each token belongs to.
-  3. HierarchicalTransformer — (B,K*P,d) with level-causal mask:
-                            level k can attend to levels 0..k only.
-                            This enforces that level 0 must predict well alone,
-                            level 1 can refine using level 0's full-image context,
-                            and so on.
+  3. HierarchicalTransformer — (B,K*P,d) with axial + cross-level mask:
+                            Within a level: axial attention (row OR column only).
+                            Across levels: token (k,p) attends to (j,p) only —
+                            same spatial position, any lower level j<k.
+                            2D RoPE encodes (row, col) into q and k so the
+                            transformer knows spatial layout without learned pos bias.
   4. GateNetwork          — after each level, a lightweight MLP produces a
                             per-position importance score in (0,1).
                             Effective weight at level k = product of gates 0..k-1
@@ -84,28 +85,117 @@ class FFN(nn.Module):
         return self.net(x)
 
 
-class SelfAttnLayer(nn.Module):
-    def __init__(self, d: int, n_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.attn  = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
-        self.ffn   = FFN(d, dropout=dropout)
-        self.norm1 = nn.LayerNorm(d)
-        self.norm2 = nn.LayerNorm(d)
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat([-x2, x1], dim=-1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        n = self.norm1(x)
-        x = x + self.attn(n, n, n, attn_mask=mask)[0]
+
+class RotaryEmbedding2D(nn.Module):
+    """
+    2D Rotary Position Embedding (RoPE) for spatial patch tokens.
+
+    head_dim is split into quarters: the first half encodes row position,
+    the second half encodes column position.  The same embedding is tiled
+    across levels so that tokens at the same spatial position but different
+    levels carry identical positional signals — level identity comes from
+    level_embed, not from RoPE.
+
+    Requires head_dim % 4 == 0.
+    """
+
+    def __init__(self, head_dim: int, n_rows: int, n_cols: int, base: float = 10000.0):
+        super().__init__()
+        assert head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
+        quarter = head_dim // 4
+        inv_freq = 1.0 / (base ** (torch.arange(quarter).float() / quarter))
+
+        rows = torch.arange(n_rows).float()
+        cols = torch.arange(n_cols).float()
+
+        freqs_row = torch.outer(rows, inv_freq)                             # (n_rows, quarter)
+        freqs_col = torch.outer(cols, inv_freq)                             # (n_cols, quarter)
+
+        P       = n_rows * n_cols
+        pos_row = freqs_row.unsqueeze(1).expand(-1, n_cols, -1).reshape(P, quarter)
+        pos_col = freqs_col.unsqueeze(0).expand(n_rows, -1, -1).reshape(P, quarter)
+
+        freqs = torch.cat([pos_row, pos_col], dim=-1)   # (P, head_dim//2)
+        emb   = torch.cat([freqs, freqs],     dim=-1)   # (P, head_dim) — duplicated for rotate_half
+
+        self.register_buffer('cos_emb', emb.cos())      # (P, head_dim)
+        self.register_buffer('sin_emb', emb.sin())      # (P, head_dim)
+        self.n_patches = P
+
+    cos_emb: torch.Tensor
+    sin_emb: torch.Tensor
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, n_levels: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # q, k: (B, n_heads, n_levels*P, head_dim)
+        cos = self.cos_emb.repeat(n_levels, 1).unsqueeze(0).unsqueeze(0)  # (1,1,n_levels*P,hd)
+        sin = self.sin_emb.repeat(n_levels, 1).unsqueeze(0).unsqueeze(0)
+        return (
+            q * cos + rotate_half(q) * sin,
+            k * cos + rotate_half(k) * sin,
+        )
+
+
+class RoPESelfAttnLayer(nn.Module):
+    """Pre-norm self-attention with 2D RoPE applied to q and k."""
+
+    def __init__(self, d: int, n_heads: int, rope: RotaryEmbedding2D, dropout: float = 0.0):
+        super().__init__()
+        assert d % n_heads == 0
+        self.n_heads   = n_heads
+        self.head_dim  = d // n_heads
+        self.scale     = self.head_dim ** -0.5
+        self.rope      = rope
+        self.dropout_p = dropout
+
+        self.qkv      = nn.Linear(d, 3 * d, bias=False)
+        self.out_proj = nn.Linear(d, d)
+        self.ffn      = FFN(d, dropout=dropout)
+        self.norm1    = nn.LayerNorm(d)
+        self.norm2    = nn.LayerNorm(d)
+
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor], n_levels: int,
+    ) -> torch.Tensor:
+        B, N, d = x.shape
+        nh, hd  = self.n_heads, self.head_dim
+
+        res  = x
+        qkv  = self.qkv(self.norm1(x)).reshape(B, N, 3, nh, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)                                       # (B, nh, N, hd)
+
+        q, k = self.rope(q, k, n_levels)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale      # (B, nh, N, N)
+        if mask is not None:
+            attn = attn + mask
+        attn = F.softmax(attn.float(), dim=-1).to(x.dtype)
+        if self.dropout_p > 0.0 and self.training:
+            attn = F.dropout(attn, p=self.dropout_p)
+
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, d)
+        x   = res + self.out_proj(out)
         return x + self.ffn(self.norm2(x))
 
 
 class HierarchicalTransformer(nn.Module):
-    def __init__(self, d: int, n_heads: int, n_layers: int, dropout: float = 0.0):
+    def __init__(self, d: int, n_heads: int, n_layers: int, n_per_side: int, dropout: float = 0.0):
         super().__init__()
-        self.layers = nn.ModuleList([SelfAttnLayer(d, n_heads, dropout) for _ in range(n_layers)])
+        self.rope   = RotaryEmbedding2D(d // n_heads, n_per_side, n_per_side)
+        self.layers = nn.ModuleList([
+            RoPESelfAttnLayer(d, n_heads, self.rope, dropout) for _ in range(n_layers)
+        ])
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, n_levels: int = 1,
+    ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x, mask, n_levels)
         return x
 
 
@@ -172,25 +262,40 @@ class PerLevelDecoder(nn.Module):
 # Mask construction
 # ---------------------------------------------------------------------------
 
-def build_hierarchical_mask(
-    n_tokens: int, n_base: int, step_size: int,
+def build_axial_cross_level_mask(
+    n_levels: int, n_patches: int, n_per_side: int,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
     Additive attention mask: 0 = may attend, -inf = blocked.
 
-    Group 0  : tokens [0, n_base)
-    Group k≥1: tokens [n_base + (k-1)*step_size, n_base + k*step_size)
+    Token (k, p) may attend to token (j, q) iff:
+      Within-level  (j == k): row(p) == row(q)  OR  col(p) == col(q)   [axial]
+      Cross-level   (j <  k): p == q                                     [same position only]
 
-    Token i may attend to token j iff group(i) >= group(j).
+    Axial within-level attention keeps lateral spatial context cheap.
+    Cross-level attention is strictly vertical so each position refines
+    itself using its own lower-level representation only.
     """
-    groups = torch.zeros(n_tokens, dtype=torch.long)
-    if n_tokens > n_base and step_size > 0:
-        groups[n_base:] = torch.arange(n_tokens - n_base) // step_size + 1
+    N   = n_levels * n_patches
+    n   = n_per_side
+    idx = torch.arange(N)
 
-    can_attend = groups.unsqueeze(1) >= groups.unsqueeze(0)
-    mask = torch.full((n_tokens, n_tokens), float('-inf'))
-    mask[can_attend] = 0.0
+    lv  = idx // n_patches          # level index
+    pos = idx % n_patches           # spatial index within level
+    row = pos // n
+    col = pos % n
+
+    li, lj = lv.unsqueeze(1),  lv.unsqueeze(0)
+    ri, rj = row.unsqueeze(1), row.unsqueeze(0)
+    ci, cj = col.unsqueeze(1), col.unsqueeze(0)
+    pi, pj = pos.unsqueeze(1), pos.unsqueeze(0)
+
+    axial = (li == lj) & ((ri == rj) | (ci == cj))
+    cross = (li >  lj) & (pi == pj)
+
+    mask = torch.full((N, N), float('-inf'))
+    mask[axial | cross] = 0.0
     return mask if device is None else mask.to(device)
 
 
@@ -264,12 +369,14 @@ class MultiLevelFluidModel(nn.Module):
         dropout: float            = 0.0,
     ):
         super().__init__()
-        P = (img_size // patch_size) ** 2
-        self.n_patches     = P
-        self.n_levels      = n_levels
+        n           = img_size // patch_size
+        P           = n * n
+        self.n_patches      = P
+        self.n_per_side     = n
+        self.n_levels       = n_levels
         self.gate_threshold = gate_threshold
-        self.gate_budget   = gate_budget
-        self.d_model       = d_model
+        self.gate_budget    = gate_budget
+        self.d_model        = d_model
 
         # Shared patch embedding — sees T*C channels
         self.patch_embed = PatchEmbed(img_size, patch_size, in_channels * window_size, d_model)
@@ -277,14 +384,17 @@ class MultiLevelFluidModel(nn.Module):
         # Level embeddings: distinguish which level each token belongs to
         self.level_embed = nn.Parameter(torch.randn(n_levels, d_model) * 0.02)
 
-        # Transformer — the level-causal mask is built per forward pass
-        self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, dropout)
+        # Transformer with 2D RoPE and axial+cross-level mask
+        self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, n, dropout)
 
         # Gate[k]: reads level-k output → importance of level-k+1 at each position
         self.gates = nn.ModuleList([GateNetwork(d_model) for _ in range(n_levels - 1)])
 
         # Decoder — one linear head per level, gated residual sum
         self.decoder = PerLevelDecoder(d_model, in_channels, img_size, patch_size, n_levels)
+
+        # Mask cache keyed by n_levels (built lazily, reused across steps)
+        self._mask_cache: dict[int, torch.Tensor] = {}
 
         self._init_weights()
 
@@ -372,11 +482,13 @@ class MultiLevelFluidModel(nn.Module):
             dim=1,
         )                              # (B, K*P, d)
 
-        # Level-causal transformer
-        mask = build_hierarchical_mask(
-            n_levels * P, n_base=P, step_size=P, device=x.device,
-        )
-        out = self.transformer(tokens, mask)   # (B, K*P, d)
+        # Axial + cross-level mask (cached per n_levels)
+        if n_levels not in self._mask_cache:
+            self._mask_cache[n_levels] = build_axial_cross_level_mask(
+                n_levels, P, self.n_per_side, device=x.device,
+            )
+        mask = self._mask_cache[n_levels]
+        out = self.transformer(tokens, mask, n_levels)   # (B, K*P, d)
 
         # Gate weights (soft, differentiable)
         weights = self.effective_gate_weights(out, n_levels)   # (B, K*P)
