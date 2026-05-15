@@ -121,12 +121,10 @@ def main() -> None:
         CurriculumCallback(steps_per_stage=args.steps_per_stage),
         ModelCheckpoint(
             dirpath              = ckpt_dir,
-            filename             = 'model-{epoch:03d}-{step:06d}-{train/loss_epoch:.4f}',
+            filename             = 'model-{epoch:03d}-{step:06d}',
             save_last            = True,
             every_n_train_steps  = 500,
-            save_top_k           = 3,
-            monitor              = 'train/loss_epoch',
-            mode                 = 'min',
+            save_top_k           = -1,
         ),
     ]
     c_print(f'Checkpoints → {ckpt_dir}', color='cyan')
