@@ -111,17 +111,15 @@ class HierarchicalTransformer(nn.Module):
 
 class PerLevelDecoder(nn.Module):
     """
-    Per-level linear decode + gated residual sum.
+    Per-level linear decode + gated residual sum + convolutional boundary smoother.
 
-    Each level k has its own projection head (LayerNorm → Linear, d → C·p²).
-    The final patch pixel values are:
+    Each level k projects its token to a patch: LayerNorm → Linear (d → C·p²).
+    The gated sum is unfolded back to image space, then a small conv refinement
+    (two 3×3 layers, same padding) blends across patch boundaries so the 32×32
+    grid artefacts are not baked into the output.
 
-        output[p] = Σ_k  gate_weight[k, p] · head_k(transformer_out[k, p])
-
-    Level 0 always has gate_weight=1.0, so it provides the base prediction.
-    Each subsequent level adds a gated residual correction at each position.
-    Positions with near-zero cumulative gate weight contribute nothing, making
-    it trivial to skip those levels at sparse-inference time.
+        patches[p] = Σ_k  gate_weight[k,p] · head_k(transformer_out[k,p])
+        output     = refine(unfold(patches))
     """
 
     def __init__(
@@ -142,6 +140,16 @@ class PerLevelDecoder(nn.Module):
             for _ in range(n_levels)
         ])
 
+        # Two conv layers with kernel=3 span patch boundaries and learn to blend them.
+        # GroupNorm over channels keeps this stable without batch statistics.
+        C = out_channels
+        self.refine = nn.Sequential(
+            nn.Conv2d(C, C * 4, kernel_size=3, padding=1),
+            nn.GroupNorm(C, C * 4),
+            nn.GELU(),
+            nn.Conv2d(C * 4, C, kernel_size=3, padding=1),
+        )
+
     def forward(self, transformer_out: torch.Tensor, gate_weights: torch.Tensor) -> torch.Tensor:
         # transformer_out: (B, n_levels*P, d)
         # gate_weights:    (B, n_levels*P)  — level 0 slice is all 1s
@@ -156,7 +164,8 @@ class PerLevelDecoder(nn.Module):
             w   = gate_weights[:, k * P : (k + 1) * P].unsqueeze(-1) # (B, P, 1)
             patches = patches + w * self.heads[k](tok)
 
-        return patches.view(B, n, n, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, n * p, n * p)
+        x = patches.view(B, n, n, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, n * p, n * p)
+        return x + self.refine(x)
 
 
 # ---------------------------------------------------------------------------
