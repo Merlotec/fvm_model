@@ -222,10 +222,13 @@ class PerLevelDecoder(nn.Module):
         self.patch_size   = patch_size
         self.out_channels = out_channels
 
+        hidden = d * 4
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(d),
-                nn.Linear(d, out_channels * patch_size * patch_size),
+                nn.Linear(d, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, out_channels * patch_size * patch_size),
             )
             for _ in range(n_levels)
         ])
