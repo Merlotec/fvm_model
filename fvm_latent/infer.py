@@ -227,9 +227,7 @@ def run_inference(
             _save_frame(out_dir, t_next, pred.cpu().numpy(), is_seed=False)
             c_print(
                 f'  pred  t={t_next:.4g}  [{step+1}/{n_steps}]'
-                f'  delta={delta.abs().mean():.4f}'
-                f'  sparsity={out["sparsity"]:.3f}'
-                f'  active={out["active_frac"]:.3f}',
+                f'  delta={delta.abs().mean():.4f}',
                 color='bright_green',
             )
 
