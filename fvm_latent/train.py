@@ -84,6 +84,8 @@ def main() -> None:
                         help='Weight for auxiliary lower-level reconstruction losses')
     parser.add_argument('--steps-per-stage', type=int,   default=_HP.get('steps_per_stage', 1000),
                         help='Optimiser steps between curriculum level expansions')
+    parser.add_argument('--first-frame',     type=int,   default=_HP.get('first_frame', 20),
+                        help='Index of first frame to include in training (skips transient startup)')
     parser.add_argument('--resume',          type=Path,  default=None,
                         help='Lightning .ckpt to resume training from')
     args = parser.parse_args()
@@ -140,6 +142,7 @@ def main() -> None:
         data_dir    = args.data_dir,
         batch_size  = args.batch_size,
         num_workers = args.num_workers,
+        first_frame = args.first_frame,
     )
 
     # ------------------------------------------------------------------

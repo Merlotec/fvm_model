@@ -1,10 +1,10 @@
 {
     "img_size": 512,
-    "patch_size": 32,
+    "patch_size": 16,
     "in_channels": 4,
     "window_size": 5,
     "n_levels": 5,
-    "d_model": 128,
+    "d_model": 256,
     "n_heads": 8,
     "n_transformer_layers": 8,
     "gate_budget": 0.4,
@@ -21,5 +21,6 @@
     "num_nodes": 1,
     "precision": "bf16-mixed",
     "noise_std": 0.02,
-    "steps_per_stage": 1000
+    "steps_per_stage": 1000,
+    "first_frame": 20
 }
