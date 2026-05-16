@@ -16,6 +16,7 @@ import torch
 import lightning as L
 from lightning.pytorch.callbacks import Callback
 from cprint import c_print
+from tqdm import tqdm
 
 from .model import MultiLevelFluidModel, _recon_loss  # noqa: E402
 
@@ -100,7 +101,7 @@ class Phase1LightningModel(L.LightningModule):
         new_n = min(self._n_active_levels + 1, self.model.n_levels)
         if new_n != self._n_active_levels:
             self._n_active_levels = new_n
-            c_print(f'Curriculum step → {new_n} active levels', color='cyan')
+            tqdm.write(f'Curriculum step → {new_n} active levels')
         self.log('curriculum/n_levels', float(self._n_active_levels), prog_bar=True)
 
     # ------------------------------------------------------------------
