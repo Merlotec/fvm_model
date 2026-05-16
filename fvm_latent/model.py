@@ -34,7 +34,7 @@ Training
   every N optimiser steps.  With 1 level the model is just a standard ViT-like
   patch predictor; each new level is a learned refinement layer.
 
-  Loss = reconstruction (MSE+L1) + sparsity_weight * (mean_active - gate_budget)²
+  Loss = reconstruction (L1+MSE) + sparsity_weight * (mean_active - gate_budget)²
   The sparsity term targets a chosen fraction of level-1+ tokens being active,
   rather than driving all gates to zero.
 
@@ -557,4 +557,4 @@ def _recon_loss(
         m      = pixel_mask.expand_as(pred)
         pred   = pred[m]
         target = target[m]
-    return F.mse_loss(pred, target) + 0.1 * F.l1_loss(pred, target)
+    return F.l1_loss(pred, target) + F.mse_loss(pred, target)
