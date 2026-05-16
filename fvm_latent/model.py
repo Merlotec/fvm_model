@@ -231,7 +231,7 @@ class PerLevelDecoder(nn.Module):
             c_out   = out_channels if is_last else max(d >> (i + 1), out_channels * 2)
             ups_layers += [
                 nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1, padding_mode='replicate'),
             ]
             if not is_last:
                 ups_layers.append(nn.GELU())
