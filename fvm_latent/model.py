@@ -37,11 +37,20 @@ Inference
 """
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention
+    from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
+    _FLEX_AVAILABLE = True
+except ImportError:
+    _flex_attention = None        # type: ignore[assignment]
+    _create_block_mask = None     # type: ignore[assignment]
+    _FLEX_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -161,11 +170,15 @@ class RoPESelfAttnLayer(nn.Module):
 
         q, k = self.rope(q, k, n_levels)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-        ).transpose(1, 2).reshape(B, N, d)
+        if _FLEX_AVAILABLE and not isinstance(mask, torch.Tensor):
+            out = _flex_attention(q, k, v, block_mask=mask, return_lse=False)
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+            )
+        out = out.transpose(1, 2).reshape(B, N, d)
         x   = res + self.out_proj(out)
         return x + self.ffn(self.norm2(x))
 
@@ -294,6 +307,23 @@ def build_axial_cross_level_mask(
     return mask if device is None else mask.to(device)
 
 
+def _make_mask_mod(n_per_side: int, n_patches: int):
+    """flex_attention mask_mod for the axial + cross-level pattern."""
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_level = q_idx // n_patches
+        k_level = kv_idx // n_patches
+        q_pos   = q_idx % n_patches
+        k_pos   = kv_idx % n_patches
+        q_row   = q_pos // n_per_side
+        q_col   = q_pos % n_per_side
+        k_row   = k_pos // n_per_side
+        k_col   = k_pos % n_per_side
+        within  = (q_level == k_level) & ((q_row == k_row) | (q_col == k_col))
+        cross   = (q_level > k_level)  & (q_pos == k_pos)
+        return within | cross
+    return mask_mod
+
+
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
@@ -346,8 +376,11 @@ class MultiLevelFluidModel(nn.Module):
         # Decoder — one linear head per level, equally weighted sum
         self.decoder = PerLevelDecoder(d_model, in_channels, img_size, patch_size, n_levels)
 
-        # Mask cache keyed by n_levels (built lazily, reused across steps)
+        # Mask caches keyed by n_levels (built lazily, reused across steps)
+        # _mask_cache: float additive mask for CPU / SDPA fallback
+        # _block_mask_cache: BlockMask for flex_attention on CUDA
         self._mask_cache: dict[int, torch.Tensor] = {}
+        self._block_mask_cache: dict[int, object] = {}
 
         self._init_weights()
 
@@ -396,11 +429,20 @@ class MultiLevelFluidModel(nn.Module):
         )                              # (B, K*P, d)
 
         # Axial + cross-level mask (cached per n_levels)
-        if n_levels not in self._mask_cache:
-            self._mask_cache[n_levels] = build_axial_cross_level_mask(
-                n_levels, P, self.n_per_side,
-            )
-        mask = self._mask_cache[n_levels].to(x.device)
+        if _FLEX_AVAILABLE and x.is_cuda:
+            if n_levels not in self._block_mask_cache:
+                self._block_mask_cache[n_levels] = _create_block_mask(
+                    _make_mask_mod(self.n_per_side, P),
+                    B=None, H=None, Q_LEN=n_levels * P, KV_LEN=n_levels * P,
+                    device=str(x.device),
+                )
+            mask = self._block_mask_cache[n_levels]
+        else:
+            if n_levels not in self._mask_cache:
+                self._mask_cache[n_levels] = build_axial_cross_level_mask(
+                    n_levels, P, self.n_per_side,
+                )
+            mask = self._mask_cache[n_levels].to(x.device)
         out = self.transformer(tokens, mask, n_levels)   # (B, K*P, d)
 
         weights = torch.ones(B, n_levels * P, device=x.device)
