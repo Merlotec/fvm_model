@@ -58,8 +58,6 @@ def build_model(hp: dict) -> MultiLevelFluidModel:
         d_model              = hp['d_model'],
         n_heads              = hp['n_heads'],
         n_transformer_layers = hp['n_transformer_layers'],
-        gate_threshold       = hp.get('gate_threshold', 0.5),
-        gate_budget          = hp.get('gate_budget', 0.4),
         dropout              = hp.get('dropout', 0.0),
     )
 
@@ -79,7 +77,6 @@ def main() -> None:
     parser.add_argument('--num-nodes',       type=int,   default=_HP['num_nodes'])
     parser.add_argument('--precision',       type=str,   default=_HP['precision'])
     parser.add_argument('--noise-std',       type=float, default=_HP.get('noise_std', 0.02))
-    parser.add_argument('--sparsity-weight', type=float, default=_HP.get('sparsity_weight', 0.1))
     parser.add_argument('--aux-weight',      type=float, default=_HP.get('aux_weight', 0.3),
                         help='Weight for auxiliary lower-level reconstruction losses')
     parser.add_argument('--steps-per-stage', type=int,   default=_HP.get('steps_per_stage', 1000),
@@ -112,12 +109,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     lit = Phase1LightningModel(
         model,
-        lr              = args.lr,
-        noise_std       = args.noise_std,
-        sparsity_weight = args.sparsity_weight,
-        aux_weight      = args.aux_weight,
-        img_size        = img_size,
-        window_size     = _HP.get('window_size', 1),
+        lr         = args.lr,
+        noise_std  = args.noise_std,
+        aux_weight = args.aux_weight,
+        img_size   = img_size,
+        window_size= _HP.get('window_size', 1),
     )
     callbacks: list[Callback] = [
         CurriculumCallback(steps_per_stage=args.steps_per_stage),

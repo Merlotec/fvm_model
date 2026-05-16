@@ -16,12 +16,7 @@ full image at the same spatial resolution.
                             same spatial position, any lower level j<k.
                             2D RoPE encodes (row, col) into q and k so the
                             transformer knows spatial layout without learned pos bias.
-  4. GateNetwork          — after each level, a lightweight MLP produces a
-                            per-position importance score in (0,1).
-                            Effective weight at level k = product of gates 0..k-1
-                            (cascade: dropping a position at level j also drops it
-                            at all higher levels).
-  5. PerLevelDecoder      — each level k projects d → d features (head_k).
+  4. PerLevelDecoder      — each level k projects d → d features (head_k).
                             Gate-weighted features are summed into a spatial map
                             (B, d, n, n), then a CNN upsampler (bilinear+conv ×log₂p)
                             decodes to full resolution (B, C, H, W).  Cross-patch conv
@@ -34,18 +29,11 @@ Training
   every N optimiser steps.  With 1 level the model is just a standard ViT-like
   patch predictor; each new level is a learned refinement layer.
 
-  Loss = reconstruction (L1+MSE) + sparsity_weight * (mean_active - gate_budget)²
-  The sparsity term targets a chosen fraction of level-1+ tokens being active,
-  rather than driving all gates to zero.
+  Loss = reconstruction (L1+MSE).  All levels contribute with uniform weight 1.
 
 Inference
 ---------
-  Soft (training-compatible): all K*P tokens present, gate scores applied as
-  value weights in the decoder.
-
-  Sparse (efficient): run levels sequentially, caching each level's KV.  After
-  each level apply hard gate threshold; only surviving positions advance.  The
-  level-causal mask ensures this is identical to the full-K forward pass.
+  All K*P tokens present, all levels contributing equally.
 """
 
 import math
@@ -311,37 +299,6 @@ def build_axial_cross_level_mask(
 
 
 # ---------------------------------------------------------------------------
-# Gate network
-# ---------------------------------------------------------------------------
-
-class GateNetwork(nn.Module):
-    """
-    Per-position importance gate.
-
-    Takes level-k transformer output (B, P, d) → scalar score per position (B, P)
-    in (0, 1).  A score near 0 means "level k+1 is not needed at this position";
-    near 1 means "keep refining here."
-
-    The gate reads the FULL transformer output at level k, which includes
-    attended context from all levels 0..k.  This gives the gate the richest
-    possible signal for deciding whether further refinement is worthwhile.
-    """
-
-    def __init__(self, d: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, d // 4),
-            nn.GELU(),
-            nn.Linear(d // 4, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)   # (B, P)
-
-
-# ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
 
@@ -358,10 +315,6 @@ class MultiLevelFluidModel(nn.Module):
         d_model:              Token embedding dimension.
         n_heads:              Attention heads.
         n_transformer_layers: Transformer depth.
-        gate_threshold:       Hard gate cutoff at inference (default 0.5).
-        gate_budget:          Target fraction of level-1+ tokens to keep during
-                              training (default 0.4).  The sparsity loss drives
-                              mean gate weight toward this target rather than 0.
         dropout:              Dropout probability.
     """
 
@@ -375,8 +328,6 @@ class MultiLevelFluidModel(nn.Module):
         d_model: int              = 512,
         n_heads: int              = 8,
         n_transformer_layers: int = 6,
-        gate_threshold: float     = 0.5,
-        gate_budget: float        = 0.4,
         dropout: float            = 0.0,
     ):
         super().__init__()
@@ -385,8 +336,6 @@ class MultiLevelFluidModel(nn.Module):
         self.n_patches      = P
         self.n_per_side     = n
         self.n_levels       = n_levels
-        self.gate_threshold = gate_threshold
-        self.gate_budget    = gate_budget
         self.d_model        = d_model
 
         # Shared patch embedding — sees T*C channels
@@ -398,10 +347,7 @@ class MultiLevelFluidModel(nn.Module):
         # Transformer with 2D RoPE and axial+cross-level mask
         self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, n, dropout)
 
-        # Gate[k]: reads level-k output → importance of level-k+1 at each position
-        self.gates = nn.ModuleList([GateNetwork(d_model) for _ in range(n_levels - 1)])
-
-        # Decoder — one linear head per level, gated residual sum
+        # Decoder — one linear head per level, equally weighted sum
         self.decoder = PerLevelDecoder(d_model, in_channels, img_size, patch_size, n_levels)
 
         # Mask cache keyed by n_levels (built lazily, reused across steps)
@@ -423,46 +369,6 @@ class MultiLevelFluidModel(nn.Module):
                 nn.init.zeros_(last_conv.bias)
 
     # ------------------------------------------------------------------
-    # Gate weight computation
-    # ------------------------------------------------------------------
-
-    def effective_gate_weights(
-        self, transformer_out: torch.Tensor, n_levels: int,
-    ) -> torch.Tensor:
-        """
-        Per-token effective weights, (B, n_levels*P).
-
-          Level 0 : weight = 1.0  (always contributes, no gate)
-          Level k : weight = gates[k-1](transformer_out[k-1])  at each position
-
-        Each level's weight is independent — gate[k-1] reads level-(k-1) output
-        and decides how much level-k's head should contribute to the output.
-
-        Independent gates avoid the cascade gradient problem where level-k heads
-        would otherwise receive gradient ≈ 0.5^k of level-0.  Each head now
-        sees a roughly uniform gradient scale regardless of depth.
-        """
-        P   = self.n_patches
-        B   = transformer_out.size(0)
-        dev = transformer_out.device
-        weights = torch.ones(B, n_levels * P, device=dev)
-
-        for k in range(n_levels - 1):
-            gate_k = self.gates[k](transformer_out[:, k * P : (k + 1) * P])  # (B, P)
-            weights[:, (k + 1) * P : (k + 2) * P] = gate_k
-
-        return weights   # (B, n_levels*P)
-
-    def active_token_fraction(
-        self, gate_weights: torch.Tensor, n_levels: int,
-    ) -> torch.Tensor:
-        """Mean fraction of level-1+ tokens above the hard gate threshold."""
-        if n_levels == 1:
-            return gate_weights.new_zeros(1).squeeze()
-        P = self.n_patches
-        return (gate_weights[:, P:] > self.gate_threshold).float().mean()
-
-    # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
 
@@ -472,10 +378,7 @@ class MultiLevelFluidModel(nn.Module):
         n_levels: active levels for this step (curriculum); defaults to self.n_levels
 
         Returns:
-            pred:         (B, C, H, W) predicted normalised frame delta
-            gate_weights: (B, n_levels*P) effective per-token weights
-            sparsity:     scalar — mean weight of level-1+ tokens (target: gate_budget)
-            active_frac:  scalar — hard-threshold fraction active at inference
+            pred: (B, C, H, W) predicted normalised frame delta
         """
         if n_levels is None:
             n_levels = self.n_levels
@@ -504,45 +407,10 @@ class MultiLevelFluidModel(nn.Module):
         mask = self._mask_cache[n_levels].to(x.device)
         out = self.transformer(tokens, mask, n_levels)   # (B, K*P, d)
 
-        # Gate weights (soft, differentiable)
-        weights = self.effective_gate_weights(out, n_levels)   # (B, K*P)
+        weights = torch.ones(B, n_levels * P, device=x.device)
+        pred    = self.decoder(out, weights)             # (B, C, H, W)
 
-        # Decode: each level's head weighted by its gate score, summed per position
-        pred = self.decoder(out, weights)                      # (B, C, H, W)
-
-        # Sparsity metrics
-        sparsity    = weights[:, P:].mean() if n_levels > 1 else weights.new_zeros(1).squeeze()
-        active_frac = self.active_token_fraction(weights, n_levels)
-
-        return {
-            'pred':         pred,
-            'gate_weights': weights,
-            'sparsity':     sparsity,
-            'active_frac':  active_frac,
-        }
-
-    # ------------------------------------------------------------------
-    # Inference helpers
-    # ------------------------------------------------------------------
-
-    def predict_with_budget(
-        self, x: torch.Tensor, max_active_fraction: float = 0.3,
-    ) -> dict:
-        """
-        Run full forward pass, then report which positions would be dropped
-        at each level if using max_active_fraction as a budget threshold.
-        Useful for profiling without implementing the sparse kernel.
-        """
-        out = self.forward(x)
-        P   = self.n_patches
-        report = []
-        for k in range(self.n_levels):
-            w      = out['gate_weights'][:, k * P : (k + 1) * P]
-            active = (w > max_active_fraction).float().mean().item()
-            report.append({'level': k, 'mean_weight': w.mean().item(), 'active_frac': active})
-        out['level_report'] = report
-        return out
-
+        return {'pred': pred}
 
 # ---------------------------------------------------------------------------
 # Loss helper

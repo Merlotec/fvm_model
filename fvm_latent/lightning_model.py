@@ -1,10 +1,10 @@
 """
 Lightning wrapper for the MultiLevelFluidModel.
 
-Single-phase training: curriculum expands active levels 1 → K while a sparsity
-loss trains the gate networks to keep a chosen budget of tokens active.
+Single-phase training: curriculum expands active levels 1 → K.
+All levels contribute with uniform weight — no gating.
 
-  Loss = recon(pred, target) + sparsity_weight * (mean_active - gate_budget)²
+  Loss = recon(pred, target)
 
 CurriculumCallback steps n_active_levels every `steps_per_stage` optimiser steps.
 """
@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 import lightning as L
 from lightning.pytorch.callbacks import Callback
 from cprint import c_print
@@ -64,13 +63,12 @@ class Phase1LightningModel(L.LightningModule):
     def __init__(
         self,
         model: MultiLevelFluidModel,
-        lr: float              = 1e-4,
-        weight_decay: float    = 1e-5,
-        noise_std: float       = 0.02,
-        sparsity_weight: float = 0.1,
-        aux_weight: float      = 0.3,
-        img_size: int          = 512,
-        window_size: int       = 5,
+        lr: float           = 1e-4,
+        weight_decay: float = 1e-5,
+        noise_std: float    = 0.02,
+        aux_weight: float   = 0.3,
+        img_size: int       = 512,
+        window_size: int    = 5,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model'])
@@ -160,11 +158,7 @@ class Phase1LightningModel(L.LightningModule):
         out = self.model(window_n, n_levels=self._n_active_levels)
 
         recon_loss = _recon_loss(out['pred'], target_n, self.pixel_mask)
-
-        sparsity_weight: float = self.hparams['sparsity_weight']  # type: ignore[index]
-        gate_budget             = self.model.gate_budget
-        sparsity_loss           = (out['sparsity'] - gate_budget).pow(2)
-        loss                    = recon_loss + sparsity_weight * sparsity_loss
+        loss       = recon_loss
 
         # Auxiliary lower-level pass: randomly sample one level below the current
         # active count and include its reconstruction loss. This keeps intermediate
@@ -183,12 +177,10 @@ class Phase1LightningModel(L.LightningModule):
         rel_err   = ((target - pred_phys).abs()[valid] /
                      target.abs()[valid].clamp(min=1e-6)).mean()
 
-        self.log('train/loss',        loss,                    prog_bar=True,  on_step=True,  on_epoch=True, sync_dist=True)
-        self.log('train/recon_loss',  recon_loss,              prog_bar=False, on_step=True,  on_epoch=True, sync_dist=True)
-        self.log('train/sparsity',    out['sparsity'],         prog_bar=True,  on_step=False, on_epoch=True, sync_dist=True)
-        self.log('train/active_frac', out['active_frac'],      prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-        self.log('train/rel_err',     rel_err,                 prog_bar=True,  on_step=False, on_epoch=True, sync_dist=True)
-        self.log('train/n_levels',    float(self._n_active_levels))
+        self.log('train/loss',       loss,                    prog_bar=True,  on_step=True,  on_epoch=True, sync_dist=True)
+        self.log('train/recon_loss', recon_loss,              prog_bar=False, on_step=True,  on_epoch=True, sync_dist=True)
+        self.log('train/rel_err',    rel_err,                 prog_bar=True,  on_step=False, on_epoch=True, sync_dist=True)
+        self.log('train/n_levels',   float(self._n_active_levels))
         return loss
 
 
