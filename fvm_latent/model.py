@@ -140,7 +140,6 @@ class RoPESelfAttnLayer(nn.Module):
         assert d % n_heads == 0
         self.n_heads   = n_heads
         self.head_dim  = d // n_heads
-        self.scale     = self.head_dim ** -0.5
         self.rope      = rope
         self.dropout_p = dropout
 
@@ -162,14 +161,11 @@ class RoPESelfAttnLayer(nn.Module):
 
         q, k = self.rope(q, k, n_levels)
 
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale      # (B, nh, N, N)
-        if mask is not None:
-            attn = attn + mask
-        attn = F.softmax(attn.float(), dim=-1).to(x.dtype)
-        if self.dropout_p > 0.0 and self.training:
-            attn = F.dropout(attn, p=self.dropout_p)
-
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, d)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        ).transpose(1, 2).reshape(B, N, d)
         x   = res + self.out_proj(out)
         return x + self.ffn(self.norm2(x))
 
