@@ -102,8 +102,6 @@ def _load_model(checkpoint: Path, device: str) -> tuple[MultiLevelFluidModel, di
         d_model              = _HP['d_model'],
         n_heads              = _HP['n_heads'],
         n_transformer_layers = _HP['n_transformer_layers'],
-        gate_threshold       = _HP.get('gate_threshold', 0.5),
-        gate_budget          = _HP.get('gate_budget', 0.4),
         dropout              = 0.0,
     ).to(device)
 
