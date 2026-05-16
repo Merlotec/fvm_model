@@ -21,11 +21,12 @@ full image at the same spatial resolution.
                             Effective weight at level k = product of gates 0..k-1
                             (cascade: dropping a position at level j also drops it
                             at all higher levels).
-  5. PerLevelDecoder      — each level k has its own linear head d → C·p².
-                            Final patch = Σ_k gate_weight[k,p] · head_k(out[k,p]).
-                            Level 0 always contributes (weight=1); higher levels
-                            contribute proportionally to their cascade gate score.
-                            At hard-gate inference, zero-gated levels are free to skip.
+  5. PerLevelDecoder      — each level k projects d → d features (head_k).
+                            Gate-weighted features are summed into a spatial map
+                            (B, d, n, n), then a CNN upsampler (bilinear+conv ×log₂p)
+                            decodes to full resolution (B, C, H, W).  Cross-patch conv
+                            operations allow spatially coherent reconstructions that a
+                            per-patch linear head cannot produce.
 
 Training
 --------
@@ -46,6 +47,8 @@ Inference
   each level apply hard gate threshold; only surviving positions advance.  The
   level-causal mask ensures this is identical to the full-K forward pass.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -201,64 +204,69 @@ class HierarchicalTransformer(nn.Module):
 
 class PerLevelDecoder(nn.Module):
     """
-    Per-level linear decode + gated residual sum + convolutional boundary smoother.
+    Gate-weighted feature aggregation + CNN upsampler.
 
-    Each level k projects its token to a patch: LayerNorm → Linear (d → C·p²).
-    The gated sum is unfolded back to image space, then a small conv refinement
-    (two 3×3 layers, same padding) blends across patch boundaries so the 32×32
-    grid artefacts are not baked into the output.
+    Each level k projects its tokens to a d-dim feature map via a small head
+    (LayerNorm → Linear).  The gate-weighted sum across levels produces a spatial
+    feature map at the coarse token resolution (n×n).  A CNN upsampler then
+    decodes this to full image resolution using bilinear upsampling + 3×3 conv
+    repeated log₂(patch_size) times, halving channels at each stage.
 
-        patches[p] = Σ_k  gate_weight[k,p] · head_k(transformer_out[k,p])
-        output     = refine(unfold(patches))
+    Cross-patch convolutions during upsampling allow spatially coherent output
+    that a per-patch linear head cannot produce.
     """
 
     def __init__(
         self, d: int, out_channels: int, img_size: int, patch_size: int, n_levels: int,
     ):
         super().__init__()
+        assert math.log2(patch_size) == int(math.log2(patch_size)), \
+            "patch_size must be a power of 2"
         n = img_size // patch_size
-        self.n_per_side   = n
-        self.n_patches    = n * n
-        self.patch_size   = patch_size
-        self.out_channels = out_channels
+        self.n_per_side = n
+        self.n_patches  = n * n
+        self.d          = d
 
-        hidden = d * 4
+        # Per-level feature projections: d → d, one per level
         self.heads = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(d),
-                nn.Linear(d, hidden),
-                nn.GELU(),
-                nn.Linear(hidden, out_channels * patch_size * patch_size),
-            )
+            nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d))
             for _ in range(n_levels)
         ])
 
-        # Two conv layers with kernel=3 span patch boundaries and learn to blend them.
-        # GroupNorm over channels keeps this stable without batch statistics.
-        C = out_channels
-        self.refine = nn.Sequential(
-            nn.Conv2d(C, C * 4, kernel_size=3, padding=1),
-            nn.GroupNorm(C, C * 4),
-            nn.GELU(),
-            nn.Conv2d(C * 4, C, kernel_size=3, padding=1),
-        )
+        # CNN upsampler: (B, d, n, n) → (B, out_channels, H, W)
+        # Halve channels at each doubling; floor at out_channels*2 before final layer.
+        n_doublings = int(math.log2(patch_size))
+        ups_layers: list[nn.Module] = []
+        c_in = d
+        for i in range(n_doublings):
+            is_last = (i == n_doublings - 1)
+            c_out   = out_channels if is_last else max(d >> (i + 1), out_channels * 2)
+            ups_layers += [
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+            ]
+            if not is_last:
+                ups_layers.append(nn.GELU())
+            c_in = c_out
+        self.upsampler = nn.Sequential(*ups_layers)
 
     def forward(self, transformer_out: torch.Tensor, gate_weights: torch.Tensor) -> torch.Tensor:
         # transformer_out: (B, n_levels*P, d)
-        # gate_weights:    (B, n_levels*P)  — level 0 slice is all 1s
+        # gate_weights:    (B, n_levels*P)  — level-0 slice is all 1s
         B        = transformer_out.size(0)
         P        = self.n_patches
-        C, p, n  = self.out_channels, self.patch_size, self.n_per_side
+        n        = self.n_per_side
+        d        = self.d
         n_levels = transformer_out.size(1) // P
 
-        patches = transformer_out.new_zeros(B, P, C * p * p)
+        feat = transformer_out.new_zeros(B, d, n, n)
         for k in range(n_levels):
-            tok = transformer_out[:, k * P : (k + 1) * P]            # (B, P, d)
-            w   = gate_weights[:, k * P : (k + 1) * P].unsqueeze(-1) # (B, P, 1)
-            patches = patches + w * self.heads[k](tok)
+            tok = transformer_out[:, k * P : (k + 1) * P]   # (B, P, d)
+            w   = gate_weights[:, k * P : (k + 1) * P]      # (B, P)
+            f_k = self.heads[k](tok)                         # (B, P, d)
+            feat = feat + (w.unsqueeze(-1) * f_k).reshape(B, n, n, d).permute(0, 3, 1, 2)
 
-        x = patches.view(B, n, n, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, n * p, n * p)
-        return x + self.refine(x)
+        return self.upsampler(feat)  # (B, out_channels, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +415,8 @@ class MultiLevelFluidModel(nn.Module):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Zero-init the last conv in refine so it starts as identity (output = 0).
-        # Without this, refine(x) ≠ 0 at init and corrupts early reconstruction.
-        last_conv = self.decoder.refine[-1]
+        # Zero-init the last conv in the upsampler so predictions start at zero delta.
+        last_conv = self.decoder.upsampler[-1]
         if isinstance(last_conv, nn.Conv2d):
             nn.init.zeros_(last_conv.weight)
             if last_conv.bias is not None:
