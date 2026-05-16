@@ -139,6 +139,7 @@ def main() -> None:
         batch_size  = args.batch_size,
         num_workers = args.num_workers,
         first_frame = args.first_frame,
+        window_size = _HP.get('window_size', 5),
     )
 
     # ------------------------------------------------------------------

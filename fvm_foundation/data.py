@@ -56,12 +56,14 @@ class FVMDataModule(L.LightningDataModule):
         batch_size:  int = 4,
         num_workers: int = 4,
         first_frame: int = FIRST_FRAME,
+        window_size: int = WINDOW_SIZE,
     ):
         super().__init__()
         self.data_dir    = Path(data_dir)
         self.batch_size  = batch_size
         self.num_workers = num_workers
         self.first_frame = first_frame
+        self.window_size = window_size
         self._renderer   = None
 
     def setup(self, stage: str | None = None):
@@ -71,7 +73,7 @@ class FVMDataModule(L.LightningDataModule):
         c_print('Scanning simulation directories...', color='yellow')
         subdirs  = sorted([p for p in self.data_dir.iterdir() if p.is_dir()])
         datasets = [
-            RenderedFVMDataset(d, self._renderer, first_frame=self.first_frame)
+            RenderedFVMDataset(d, self._renderer, window_size=self.window_size, first_frame=self.first_frame)
             for d in subdirs
         ]
         datasets = [ds for ds in datasets if len(ds) > 0]

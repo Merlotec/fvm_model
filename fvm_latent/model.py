@@ -364,11 +364,13 @@ class MultiLevelFluidModel(nn.Module):
         self.n_levels       = n_levels
         self.d_model        = d_model
 
-        # Shared patch embedding — sees T*C channels
+        # Shared patch embedding — extracts local patch features once
         self.patch_embed = PatchEmbed(img_size, patch_size, in_channels * window_size, d_model)
 
-        # Level embeddings: distinguish which level each token belongs to
-        self.level_embed = nn.Parameter(torch.randn(n_levels, d_model) * 0.02)
+        # Per-level linear projections — each level gets a distinct learned readout
+        self.level_projs = nn.ModuleList([
+            nn.Linear(d_model, d_model) for _ in range(n_levels)
+        ])
 
         # Transformer with 2D RoPE and axial+cross-level mask
         self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, n, dropout)
@@ -419,14 +421,12 @@ class MultiLevelFluidModel(nn.Module):
         B = x.size(0)
         P = self.n_patches
 
-        # Base patch features, shared across all levels
-        base = self.patch_embed(x)    # (B, P, d)
-
-        # Stack K copies with different level embeddings
+        # Shared patch features, projected differently per level
+        base   = self.patch_embed(x)                                      # (B, P, d)
         tokens = torch.cat(
-            [base + self.level_embed[k] for k in range(n_levels)],
+            [self.level_projs[k](base) for k in range(n_levels)],
             dim=1,
-        )                              # (B, K*P, d)
+        )                                                                  # (B, K*P, d)
 
         # Axial + cross-level mask (cached per n_levels)
         if _FLEX_AVAILABLE and x.is_cuda:
