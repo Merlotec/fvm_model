@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from stacking_patch import StackingPatchEmbedding
 from axial_transformer import FluidAxialTransformer
-from linear_overflow_decoder import LinearOverflowDecoder
+from cnn_decoder import CNNDecoder
 
 
 class FluidVisionModel(nn.Module):
@@ -16,7 +16,7 @@ class FluidVisionModel(nn.Module):
 
         self.patch_embed = StackingPatchEmbedding(num_obs, num_channels, patch_size, emb_dim)
         self.transformer = FluidAxialTransformer(emb_dim, grid_size=grid_size, num_layers=num_layers)
-        self.decoder     = LinearOverflowDecoder(emb_dim, num_channels, patch_size, grid_size)
+        self.decoder     = CNNDecoder(emb_dim, num_channels, patch_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, C, H, W)
