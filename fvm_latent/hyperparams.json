@@ -12,12 +12,12 @@
     "batch_size": 8,
     "lr": 1e-4,
     "weight_decay": 1e-5,
-    "aux_weight": 0.3,
+    "aux_weight": 0.0,
     "num_workers": 4,
     "devices": -1,
     "num_nodes": 1,
     "precision": "bf16-mixed",
-    "noise_std": 0.02,
+    "noise_std": 0.0,
     "steps_per_stage": 1000,
     "first_frame": 20
 }

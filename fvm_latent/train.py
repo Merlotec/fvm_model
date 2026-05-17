@@ -147,13 +147,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     use_ddp = torch.cuda.is_available() and (args.devices != 1 or args.num_nodes > 1)
     trainer = L.Trainer(
-        max_epochs        = args.epochs,
-        devices           = args.devices,
-        num_nodes         = args.num_nodes,
-        strategy          = 'ddp' if use_ddp else 'auto',
-        precision         = args.precision,
-        callbacks         = callbacks,
-        log_every_n_steps = 10,
+        max_epochs          = args.epochs,
+        devices             = args.devices,
+        num_nodes           = args.num_nodes,
+        strategy            = 'ddp' if use_ddp else 'auto',
+        precision           = args.precision,
+        callbacks           = callbacks,
+        log_every_n_steps   = 10,
+        gradient_clip_val   = 1.0,
     )
 
     torch.set_float32_matmul_precision('high')
