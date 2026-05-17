@@ -18,6 +18,6 @@
     "num_nodes": 1,
     "precision": "bf16-mixed",
     "noise_std": 0.0,
-    "steps_per_stage": 50,
+    "steps_per_stage": 100,
     "first_frame": 20
 }
