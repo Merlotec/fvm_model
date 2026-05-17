@@ -115,15 +115,16 @@ def main() -> None:
         img_size   = img_size,
         window_size= _HP.get('window_size', 1),
     )
+    ckpt_callback = ModelCheckpoint(
+        dirpath             = ckpt_dir,
+        filename            = 'model-{epoch:03d}-{step:06d}',
+        save_last           = True,
+        every_n_train_steps = 500,
+        save_top_k          = -1,
+    )
     callbacks: list[Callback] = [
         CurriculumCallback(steps_per_stage=args.steps_per_stage),
-        ModelCheckpoint(
-            dirpath              = ckpt_dir,
-            filename             = 'model-{epoch:03d}-{step:06d}',
-            save_last            = True,
-            every_n_train_steps  = 500,
-            save_top_k           = -1,
-        ),
+        ckpt_callback,
     ]
     c_print(f'Checkpoints → {ckpt_dir}', color='cyan')
     c_print(
@@ -160,7 +161,7 @@ def main() -> None:
     torch.set_float32_matmul_precision('high')
     trainer.fit(lit, datamodule=datamodule, ckpt_path=args.resume)
 
-    best = callbacks[-1].best_model_path  # type: ignore[union-attr]
+    best = ckpt_callback.best_model_path
     c_print(f'\nBest checkpoint: {best}', color='bright_magenta')
 
 
