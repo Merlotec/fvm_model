@@ -199,9 +199,45 @@ class HierarchicalTransformer(nn.Module):
         return x
 
 
+class SkipEncoder(nn.Module):
+    """
+    Lightweight multi-scale feature extractor for U-Net-style skip connections.
+
+    Produces one feature map per decoder upsampling stage, starting at full
+    input resolution and halving spatial size with each stage.  The decoder
+    injects feats[-1] at its coarsest stage and feats[0] at its finest,
+    giving the CNN upsampler direct access to high-frequency pixel content
+    it cannot recover from patch tokens alone.
+    """
+
+    def __init__(self, in_channels: int, skip_ch: int, n_doublings: int):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, skip_ch, kernel_size=3, padding=1, padding_mode='replicate'),
+            nn.GELU(),
+        )
+        self.downs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(skip_ch, skip_ch, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+            )
+            for _ in range(n_doublings - 1)
+        ])
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Returns [full_res, half_res, ..., coarsest_res] feature maps."""
+        feats: list[torch.Tensor] = []
+        f = self.stem(x)
+        feats.append(f)
+        for down in self.downs:
+            f = down(f)
+            feats.append(f)
+        return feats
+
+
 class PerLevelDecoder(nn.Module):
     """
-    Gate-weighted feature aggregation + CNN upsampler.
+    Gate-weighted feature aggregation + CNN upsampler with skip connections.
 
     Each level k projects its tokens to a d-dim feature map via a small head
     (LayerNorm → Linear).  The gate-weighted sum across levels produces a spatial
@@ -209,20 +245,23 @@ class PerLevelDecoder(nn.Module):
     decodes this to full image resolution using bilinear upsampling + 3×3 conv
     repeated log₂(patch_size) times, halving channels at each stage.
 
-    Cross-patch convolutions during upsampling allow spatially coherent output
-    that a per-patch linear head cannot produce.
+    At each upsampling stage, skip features from the SkipEncoder are concatenated
+    before the conv, giving the decoder direct access to sub-patch spatial detail.
     """
 
     def __init__(
         self, d: int, out_channels: int, img_size: int, patch_size: int, n_levels: int,
+        skip_ch: int = 0,
     ):
         super().__init__()
         assert math.log2(patch_size) == int(math.log2(patch_size)), \
             "patch_size must be a power of 2"
         n = img_size // patch_size
-        self.n_per_side = n
-        self.n_patches  = n * n
-        self.d          = d
+        self.n_per_side  = n
+        self.n_patches   = n * n
+        self.d           = d
+        n_doublings      = int(math.log2(patch_size))
+        self.n_doublings = n_doublings
 
         # Per-level feature projections: d → d, one per level
         self.heads = nn.ModuleList([
@@ -230,26 +269,29 @@ class PerLevelDecoder(nn.Module):
             for _ in range(n_levels)
         ])
 
-        # CNN upsampler: (B, d, n, n) → (B, out_channels, H, W)
-        # Halve channels at each doubling; floor at out_channels*2 before final layer.
-        n_doublings = int(math.log2(patch_size))
-        ups_layers: list[nn.Module] = []
+        # Upsampler stages as explicit lists so skip features can be injected
+        # between the bilinear upsample and the conv at each stage.
+        self.up_convs: nn.ModuleList = nn.ModuleList()
+        self.up_acts:  nn.ModuleList = nn.ModuleList()
         c_in = d
         for i in range(n_doublings):
             is_last = (i == n_doublings - 1)
             c_out   = out_channels if is_last else max(d >> (i + 1), out_channels * 2)
-            ups_layers += [
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1, padding_mode='replicate'),
-            ]
-            if not is_last:
-                ups_layers.append(nn.GELU())
+            self.up_convs.append(
+                nn.Conv2d(c_in + skip_ch, c_out, kernel_size=3, padding=1, padding_mode='replicate')
+            )
+            self.up_acts.append(nn.GELU() if not is_last else nn.Identity())
             c_in = c_out
-        self.upsampler = nn.Sequential(*ups_layers)
 
-    def forward(self, transformer_out: torch.Tensor, gate_weights: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        transformer_out: torch.Tensor,
+        gate_weights: torch.Tensor,
+        skip_feats: Optional[list[torch.Tensor]] = None,
+    ) -> torch.Tensor:
         # transformer_out: (B, n_levels*P, d)
-        # gate_weights:    (B, n_levels*P)  — level-0 slice is all 1s
+        # gate_weights:    (B, n_levels*P)
+        # skip_feats:      [full_res, ..., coarsest_res] from SkipEncoder
         B        = transformer_out.size(0)
         P        = self.n_patches
         n        = self.n_per_side
@@ -262,8 +304,15 @@ class PerLevelDecoder(nn.Module):
             w   = gate_weights[:, k * P : (k + 1) * P]      # (B, P)
             f_k = self.heads[k](tok)                         # (B, P, d)
             feat = feat + (w.unsqueeze(-1) * f_k).reshape(B, n, n, d).permute(0, 3, 1, 2)
+        feat = feat / n_levels
 
-        return self.upsampler(feat / n_levels)  # (B, out_channels, H, W)
+        for i, (conv, act) in enumerate(zip(self.up_convs, self.up_acts)):
+            feat = F.interpolate(feat, scale_factor=2, mode='bilinear', align_corners=False)
+            if skip_feats is not None:
+                feat = torch.cat([feat, skip_feats[self.n_doublings - 1 - i]], dim=1)
+            feat = act(conv(feat))
+
+        return feat  # (B, out_channels, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +404,7 @@ class MultiLevelFluidModel(nn.Module):
         n_heads: int              = 8,
         n_transformer_layers: int = 6,
         dropout: float            = 0.0,
+        skip_ch: int              = 32,
     ):
         super().__init__()
         n           = img_size // patch_size
@@ -363,6 +413,8 @@ class MultiLevelFluidModel(nn.Module):
         self.n_per_side     = n
         self.n_levels       = n_levels
         self.d_model        = d_model
+
+        n_doublings = int(math.log2(patch_size))
 
         # Shared patch embedding — extracts local patch features once
         self.patch_embed = PatchEmbed(img_size, patch_size, in_channels * window_size, d_model)
@@ -375,8 +427,11 @@ class MultiLevelFluidModel(nn.Module):
         # Transformer with 2D RoPE and axial+cross-level mask
         self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, n, dropout)
 
-        # Decoder — one linear head per level, equally weighted sum
-        self.decoder = PerLevelDecoder(d_model, in_channels, img_size, patch_size, n_levels)
+        # Skip encoder: multi-scale features from raw input for the decoder
+        self.skip_encoder = SkipEncoder(in_channels * window_size, skip_ch, n_doublings)
+
+        # Decoder — one linear head per level, equally weighted sum + skip connections
+        self.decoder = PerLevelDecoder(d_model, in_channels, img_size, patch_size, n_levels, skip_ch=skip_ch)
 
         # Mask caches keyed by n_levels (built lazily, reused across steps)
         # _mask_cache: float additive mask for CPU / SDPA fallback
@@ -392,8 +447,8 @@ class MultiLevelFluidModel(nn.Module):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Zero-init the last conv in the upsampler so predictions start at zero delta.
-        last_conv = self.decoder.upsampler[-1]
+        # Zero-init the last conv so predictions start at zero delta.
+        last_conv = self.decoder.up_convs[-1]
         if isinstance(last_conv, nn.Conv2d):
             nn.init.zeros_(last_conv.weight)
             if last_conv.bias is not None:
@@ -421,6 +476,9 @@ class MultiLevelFluidModel(nn.Module):
         B = x.size(0)
         P = self.n_patches
 
+        # Multi-scale skip features from raw input (before patch projection)
+        skip_feats = self.skip_encoder(x)
+
         # Shared patch features, projected differently per level
         base   = self.patch_embed(x)                                      # (B, P, d)
         tokens = torch.cat(
@@ -446,7 +504,7 @@ class MultiLevelFluidModel(nn.Module):
         out = self.transformer(tokens, mask, n_levels)   # (B, K*P, d)
 
         weights = torch.ones(B, n_levels * P, device=x.device)
-        pred    = self.decoder(out, weights)             # (B, C, H, W)
+        pred    = self.decoder(out, weights, skip_feats) # (B, C, H, W)
 
         return {'pred': pred}
 

@@ -8,6 +8,7 @@
     "n_heads": 8,
     "n_transformer_layers": 12,
     "dropout": 0.0,
+    "skip_ch": 32,
     "epochs": 30,
     "batch_size": 8,
     "lr": 1e-4,

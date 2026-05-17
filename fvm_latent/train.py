@@ -59,6 +59,7 @@ def build_model(hp: dict) -> MultiLevelFluidModel:
         n_heads              = hp['n_heads'],
         n_transformer_layers = hp['n_transformer_layers'],
         dropout              = hp.get('dropout', 0.0),
+        skip_ch              = hp.get('skip_ch', 32),
     )
 
 
