@@ -68,14 +68,15 @@ def build_renderer(dataset_dir: Path, resolution: tuple[int, int], device: str) 
 
 # ---- dataset statistics ----
 
-def compute_delta_stats(sim_dirs: list[Path], renderer: MeshRenderer, n_samples: int = 200):
+def compute_delta_stats(sim_dirs: list[Path], renderer: MeshRenderer, n_samples: int = 200,
+                        first_frame: int = 0):
     """Sample consecutive frame pairs to estimate per-channel delta mean and std."""
     all_pairs = []
     for d in sim_dirs:
         files = sorted(
             [f for f in d.iterdir() if f.name.startswith('t_') and f.name.endswith('.npz')],
             key=lambda f: float(f.stem[2:]),
-        )
+        )[first_frame:]
         for i in range(len(files) - 1):
             all_pairs.append((files[i], files[i + 1]))
 

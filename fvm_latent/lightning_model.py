@@ -50,30 +50,28 @@ class Phase1LightningModel(L.LightningModule):
     """
     Curriculum training for MultiLevelFluidModel.
 
-    Starts with 1 active level. CurriculumCallback calls step_curriculum()
-    every N steps to add one level until all K levels are active.
+    Starts with `start_levels` active levels (default 1). CurriculumCallback
+    calls step_curriculum() every N steps to add one level until all K levels
+    are active. Set start_levels=model.n_levels to skip curriculum entirely.
 
     Loss = reconstruction + sparsity_weight * (mean_active - gate_budget)²
-
-    The reconstruction term teaches each level to predict the residual.
-    The sparsity term targets gate_budget fraction of level-1+ tokens active,
-    preventing both gate collapse and unbounded token use.
     """
 
     def __init__(
         self,
         model: MultiLevelFluidModel,
         lr: float           = 1e-4,
-        weight_decay: float = 1e-5,
+        weight_decay: float = 0.0,
         noise_std: float    = 0.02,
         aux_weight: float   = 0.3,
         img_size: int       = 512,
         window_size: int    = 5,
+        start_levels: int   = 1,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model'])
         self.model            = model
-        self._n_active_levels = 1
+        self._n_active_levels = max(1, min(start_levels, model.n_levels))
 
         N = 4
         self.register_buffer('input_mean', torch.zeros(1, N, 1, 1))
@@ -186,6 +184,7 @@ class Phase1LightningModel(L.LightningModule):
     def configure_optimizers(self):  # type: ignore[override]
         lr: float = self.hparams['lr']           # type: ignore[index]
         wd: float = self.hparams['weight_decay'] # type: ignore[index]
-        opt   = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=50_000, eta_min=1e-6)
+        opt        = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
+        total_steps = max(1, int(self.trainer.estimated_stepping_batches))
+        sched       = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps, eta_min=1e-6)
         return {'optimizer': opt, 'lr_scheduler': {'scheduler': sched, 'interval': 'step'}}

@@ -87,7 +87,7 @@ class FVMDataModule(L.LightningDataModule):
         c_print(f'Pixel mask saved — {pixel_mask.sum().item()} fluid pixels of {pixel_mask.numel()}', color='green')
 
         c_print('Computing delta statistics (sampling 200 frame pairs)...', color='yellow')
-        mean, std = compute_delta_stats(subdirs, self._renderer)
+        mean, std = compute_delta_stats(subdirs, self._renderer, first_frame=self.first_frame)
         with open(DELTA_STATS_PATH, 'w') as f:
             json.dump({'mean': mean.tolist(), 'std': std.tolist()}, f)
         c_print(f'Delta stats saved — mean={[f"{v:.4f}" for v in mean.tolist()]}  std={[f"{v:.4f}" for v in std.tolist()]}', color='green')

@@ -107,13 +107,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Lightning model + callbacks
     # ------------------------------------------------------------------
+    use_curriculum  = args.steps_per_stage > 0
+    start_levels    = 1 if use_curriculum else model.n_levels
     lit = Phase1LightningModel(
         model,
-        lr         = args.lr,
-        noise_std  = args.noise_std,
-        aux_weight = args.aux_weight,
-        img_size   = img_size,
-        window_size= _HP.get('window_size', 1),
+        lr           = args.lr,
+        noise_std    = args.noise_std,
+        aux_weight   = args.aux_weight,
+        img_size     = img_size,
+        window_size  = _HP.get('window_size', 1),
+        start_levels = start_levels,
     )
     ckpt_callback = ModelCheckpoint(
         dirpath             = ckpt_dir,
@@ -122,15 +125,17 @@ def main() -> None:
         every_n_train_steps = 500,
         save_top_k          = -1,
     )
-    callbacks: list[Callback] = [
-        CurriculumCallback(steps_per_stage=args.steps_per_stage),
-        ckpt_callback,
-    ]
+    callbacks: list[Callback] = [ckpt_callback]
+    if use_curriculum:
+        callbacks.append(CurriculumCallback(steps_per_stage=args.steps_per_stage))
     c_print(f'Checkpoints → {ckpt_dir}', color='cyan')
-    c_print(
-        f'Curriculum: 1 → {model.n_levels} levels, +1 every {args.steps_per_stage} steps',
-        color='bright_green',
-    )
+    if use_curriculum:
+        c_print(
+            f'Curriculum: 1 → {model.n_levels} levels, +1 every {args.steps_per_stage} steps',
+            color='bright_green',
+        )
+    else:
+        c_print(f'Curriculum disabled — all {model.n_levels} levels active from step 0', color='bright_green')
 
     # ------------------------------------------------------------------
     # Data

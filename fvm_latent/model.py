@@ -263,7 +263,7 @@ class PerLevelDecoder(nn.Module):
             f_k = self.heads[k](tok)                         # (B, P, d)
             feat = feat + (w.unsqueeze(-1) * f_k).reshape(B, n, n, d).permute(0, 3, 1, 2)
 
-        return self.upsampler(feat)  # (B, out_channels, H, W)
+        return self.upsampler(feat / n_levels)  # (B, out_channels, H, W)
 
 
 # ---------------------------------------------------------------------------
