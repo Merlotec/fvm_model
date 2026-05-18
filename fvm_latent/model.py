@@ -170,14 +170,25 @@ class RoPESelfAttnLayer(nn.Module):
 
         q, k = self.rope(q, k, n_levels)
 
+        out: torch.Tensor
         if _FLEX_AVAILABLE and not isinstance(mask, torch.Tensor):
-            out = _flex_attention(q, k, v, block_mask=mask, return_lse=False)
-        else:
+            out = _flex_attention(q, k, v, block_mask=mask, return_lse=False)  # type: ignore[assignment]
+        elif q.is_cuda:
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
                 dropout_p=self.dropout_p if self.training else 0.0,
             )
+        else:
+            # CPU / MPS: SDPA backward with bool masks is broken on these backends;
+            # use explicit matmul attention instead.
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5)
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float('-inf'))
+            attn = torch.softmax(scores, dim=-1)
+            if self.dropout_p > 0.0 and self.training:
+                attn = F.dropout(attn, p=self.dropout_p)
+            out = attn @ v
         out = out.transpose(1, 2).reshape(B, N, d)
         x   = res + self.out_proj(out)
         return x + self.ffn(self.norm2(x))
@@ -351,8 +362,7 @@ def build_axial_cross_level_mask(
     axial = (li == lj) & ((ri == rj) | (ci == cj))
     cross = (li >  lj) & (pi == pj)
 
-    mask = torch.full((N, N), float('-inf'))
-    mask[axial | cross] = 0.0
+    mask = axial | cross  # True = may attend
     return mask if device is None else mask.to(device)
 
 
@@ -517,8 +527,11 @@ def _recon_loss(
     target: torch.Tensor,
     pixel_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    l1  = F.l1_loss(pred, target, reduction='none')
+    mse = F.mse_loss(pred, target, reduction='none')
     if pixel_mask is not None:
-        m      = pixel_mask.expand_as(pred)
-        pred   = pred[m]
-        target = target[m]
-    return F.l1_loss(pred, target) + F.mse_loss(pred, target)
+        # Avoid boolean indexing — its backward is broken on CPU/MPS backends.
+        m = pixel_mask.float().expand_as(pred)
+        n = m.sum().clamp(min=1)
+        return (l1 * m).sum() / n + (mse * m).sum() / n
+    return l1.mean() + mse.mean()
