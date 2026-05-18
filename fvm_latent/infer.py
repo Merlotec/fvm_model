@@ -103,6 +103,7 @@ def _load_model(checkpoint: Path, device: str) -> tuple[MultiLevelFluidModel, di
         n_heads              = _HP['n_heads'],
         n_transformer_layers = _HP['n_transformer_layers'],
         dropout              = 0.0,
+        decoder_type         = _HP.get('decoder_type', 'per_level'),
     ).to(device)
 
     ckpt  = torch.load(checkpoint, map_location=device, weights_only=True)

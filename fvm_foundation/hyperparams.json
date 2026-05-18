@@ -1,5 +1,5 @@
 {
-    "resolution": [512, 512],
+    "resolution": [256, 256],
     "patch_size": 32,
     "emb_dim": 512,
     "n_channels": 4,

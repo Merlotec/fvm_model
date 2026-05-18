@@ -60,6 +60,7 @@ def build_model(hp: dict) -> MultiLevelFluidModel:
         n_transformer_layers = hp['n_transformer_layers'],
         dropout              = hp.get('dropout', 0.0),
         skip_ch              = hp.get('skip_ch', 32),
+        decoder_type         = hp.get('decoder_type', 'per_level'),
     )
 
 
@@ -97,9 +98,10 @@ def main() -> None:
     model   = build_model(_HP)
     n_param = sum(p.numel() for p in model.parameters()) / 1e6
     P       = model.n_patches
+    decoder_type = _HP.get('decoder_type', 'per_level')
     c_print(
         f'Model: {n_param:.1f}M params | {model.n_levels} levels × {P} patches = '
-        f'{model.n_levels * P} tokens max',
+        f'{model.n_levels * P} tokens max | decoder={decoder_type}',
         color='cyan',
     )
 

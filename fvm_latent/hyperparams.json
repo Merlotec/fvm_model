@@ -1,15 +1,15 @@
 {
-    "img_size": 512,
+    "img_size": 256,
     "patch_size": 16,
     "in_channels": 4,
     "window_size": 4,
     "n_levels": 4,
-    "d_model": 256,
+    "d_model": 768,
     "n_heads": 8,
     "n_transformer_layers": 12,
     "dropout": 0.0,
     "skip_ch": 32,
-    "epochs": 30,
+    "epochs": 80,
     "batch_size": 8,
     "lr": 1e-4,
     "weight_decay": 0,
@@ -20,5 +20,6 @@
     "precision": "32",
     "noise_std": 0.0,
     "steps_per_stage": 100,
-    "first_frame": 20
+    "first_frame": 40,
+    "decoder_type": "overlapping"
 }

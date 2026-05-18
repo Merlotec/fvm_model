@@ -326,6 +326,154 @@ class PerLevelDecoder(nn.Module):
         return feat  # (B, out_channels, H, W)
 
 
+class OverlappingPatchDecoder(nn.Module):
+    """
+    Simple decoder that reconstructs the image via overlapping patches.
+
+    Each patch token at grid position (i, j) predicts a (3p/2 × 3p/2) region
+    centred on the patch centre, extending p/4 pixels (25% of p) into each
+    neighbour's territory.  Where two patches overlap the contribution is a
+    weighted average with weight proportional to the *proximity* to the patch
+    centre:
+
+        w(Δy, Δx) = (p/2 − |Δy|) · (p/2 − |Δx|)      (separable tent kernel)
+
+    The final pixel value is the normalized weighted sum across all contributing
+    patches.  Pixels in the overlap zone are automatically down-weighted because
+    the normalization denominator accumulates contributions from all covering
+    patches.
+
+    The normalization denominator is pre-computed as a fixed buffer so no
+    per-sample work is wasted.
+
+    Args:
+        d:            Transformer token dimension.
+        out_channels: Output image channels.
+        img_size:     Spatial resolution (square, must equal n · patch_size).
+        patch_size:   Patch size in pixels (must be divisible by 4).
+        n_levels:     Number of refinement levels (determines number of heads).
+    """
+
+    def __init__(
+        self,
+        d: int,
+        out_channels: int,
+        img_size: int,
+        patch_size: int,
+        n_levels: int,
+        skip_ch: int = 0,
+    ):
+        super().__init__()
+        assert patch_size % 4 == 0, "patch_size must be divisible by 4 for 25 % overlap"
+        self.patch_size   = patch_size
+        self.img_size     = img_size
+        self.out_channels = out_channels
+        self.skip_ch      = skip_ch
+        n = img_size // patch_size
+        self.n_per_side = n
+        self.n_patches  = n * n
+        # 25 % overlap: extend p/4 into each neighbour → kernel = p + 2*(p/4) = 3p/2
+        kernel          = patch_size + patch_size // 2
+        self.kernel     = kernel
+
+        # Per-level MLP heads: d → d → C · kernel² (two-layer for expressivity)
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(d),
+                nn.Linear(d, d),
+                nn.GELU(),
+                nn.Linear(d, out_channels * kernel * kernel),
+            )
+            for _ in range(n_levels)
+        ])
+
+        # Post-fold spatial refinement CNN (residual correction)
+        mid = max(out_channels * 8, 64)
+        self.post_conv = nn.Sequential(
+            nn.Conv2d(out_channels + skip_ch, mid, 3, padding=1, padding_mode='replicate'),
+            nn.GELU(),
+            nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
+        )
+
+        # ---- weight kernel (tent / bilinear) --------------------------------
+        # Pixel centres sit at 0.5, 1.5, … within the (kernel × kernel) patch.
+        # The patch centre in continuous coords is kernel / 2 = 3p/4.
+        # Tent half-width equals kernel / 2 so the weight reaches 0.5 at each edge.
+        coords = torch.arange(kernel).float() + 0.5       # (kernel,)
+        centre = kernel / 2.0                              # = 3p/4
+        w1d    = (centre - (coords - centre).abs()).clamp(min=0)  # tent
+        wk_2d  = w1d.unsqueeze(1) * w1d.unsqueeze(0)      # (kernel, kernel)
+        self.register_buffer('weight_kernel', wk_2d)
+
+        # ---- pre-compute normalization denominator --------------------------
+        # fold the weight kernel (one channel, one block per patch) to get the
+        # per-pixel sum of tent weights; dividing by this gives the normalized
+        # weighted average.
+        wk_flat = wk_2d.flatten()                          # (kernel²,)
+        norm_in = wk_flat.unsqueeze(0).unsqueeze(-1).expand(1, -1, n * n)  # (1, kernel², n²)
+        norm = F.fold(
+            norm_in.contiguous(),
+            output_size=(img_size, img_size),
+            kernel_size=kernel,
+            stride=patch_size,
+            padding=patch_size // 4,
+        )                                                  # (1, 1, H, W)
+        self.register_buffer('norm_map', norm)
+
+    weight_kernel: torch.Tensor
+    norm_map: torch.Tensor
+
+    def forward(
+        self,
+        transformer_out: torch.Tensor,
+        gate_weights: torch.Tensor,
+        skip_feats: Optional[list[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        # transformer_out: (B, n_levels*P, d)
+        # gate_weights:    (B, n_levels*P)
+        B        = transformer_out.size(0)
+        P        = self.n_patches
+        C        = self.out_channels
+        p        = self.patch_size
+        kernel   = self.kernel
+        n_levels = transformer_out.size(1) // P
+
+        # Accumulate gate-weighted, per-level patch predictions
+        patch_preds = transformer_out.new_zeros(B, P, C * kernel * kernel)
+        for k in range(n_levels):
+            tok = transformer_out[:, k * P : (k + 1) * P]   # (B, P, d)
+            w   = gate_weights[:, k * P : (k + 1) * P]      # (B, P)
+            f_k = self.heads[k](tok)                          # (B, P, C·kernel²)
+            patch_preds = patch_preds + w.unsqueeze(-1) * f_k
+        patch_preds = patch_preds / n_levels                  # (B, P, C·kernel²)
+
+        # Apply tent weights to every patch's pixel predictions
+        # (B, P, C, kernel²) → multiply by (kernel²,) → rearrange to (B, C·kernel², P)
+        wk_flat     = self.weight_kernel.flatten()            # (kernel²,)
+        patch_preds = patch_preds.reshape(B, P, C, kernel * kernel)
+        patch_preds = patch_preds * wk_flat                   # broadcast over B, P, C
+        patch_preds = patch_preds.permute(0, 2, 3, 1).reshape(B, C * kernel * kernel, P)
+
+        # Fold weighted predictions into image space
+        output = F.fold(
+            patch_preds.contiguous(),
+            output_size=(self.img_size, self.img_size),
+            kernel_size=kernel,
+            stride=p,
+            padding=p // 4,
+        )                                                      # (B, C, H, W)
+
+        # Divide by pre-computed weight denominator → normalized weighted average
+        output = output / self.norm_map.to(output.device).clamp(min=1e-6)
+
+        # Residual spatial refinement via post-fold CNN
+        if self.skip_ch > 0 and skip_feats is not None and len(skip_feats) > 0:
+            post_in = torch.cat([output, skip_feats[0]], dim=1)
+        else:
+            post_in = output
+        return output + self.post_conv(post_in)
+
+
 # ---------------------------------------------------------------------------
 # Mask construction
 # ---------------------------------------------------------------------------
@@ -415,8 +563,11 @@ class MultiLevelFluidModel(nn.Module):
         n_transformer_layers: int = 6,
         dropout: float            = 0.0,
         skip_ch: int              = 32,
+        decoder_type: str         = 'per_level',
     ):
         super().__init__()
+        assert decoder_type in ('per_level', 'overlapping'), \
+            f"decoder_type must be 'per_level' or 'overlapping', got {decoder_type!r}"
         n           = img_size // patch_size
         P           = n * n
         self.n_patches      = P
@@ -437,11 +588,20 @@ class MultiLevelFluidModel(nn.Module):
         # Transformer with 2D RoPE and axial+cross-level mask
         self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, n, dropout)
 
-        # Skip encoder: multi-scale features from raw input for the decoder
-        self.skip_encoder = SkipEncoder(in_channels * window_size, skip_ch, n_doublings)
-
-        # Decoder — one linear head per level, equally weighted sum + skip connections
-        self.decoder = PerLevelDecoder(d_model, in_channels, img_size, patch_size, n_levels, skip_ch=skip_ch)
+        if decoder_type == 'per_level':
+            # Skip encoder: multi-scale features from raw input for the decoder
+            self.skip_encoder: Optional[SkipEncoder] = SkipEncoder(
+                in_channels * window_size, skip_ch, n_doublings,
+            )
+            self.decoder: nn.Module = PerLevelDecoder(
+                d_model, in_channels, img_size, patch_size, n_levels, skip_ch=skip_ch,
+            )
+        else:
+            # n_doublings=1 → SkipEncoder produces one full-resolution feature map
+            self.skip_encoder = SkipEncoder(in_channels * window_size, skip_ch, n_doublings=1)
+            self.decoder = OverlappingPatchDecoder(
+                d_model, in_channels, img_size, patch_size, n_levels, skip_ch=skip_ch,
+            )
 
         # Mask caches keyed by n_levels (built lazily, reused across steps)
         # _mask_cache: float additive mask for CPU / SDPA fallback
@@ -457,9 +617,16 @@ class MultiLevelFluidModel(nn.Module):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Zero-init the last conv so predictions start at zero delta.
-        last_conv = self.decoder.up_convs[-1]
-        if isinstance(last_conv, nn.Conv2d):
+        # Zero-init final output conv so predictions start at zero delta.
+        if isinstance(self.decoder, PerLevelDecoder):
+            last_conv = self.decoder.up_convs[-1]
+            if isinstance(last_conv, nn.Conv2d):
+                nn.init.zeros_(last_conv.weight)
+                if last_conv.bias is not None:
+                    nn.init.zeros_(last_conv.bias)
+        elif isinstance(self.decoder, OverlappingPatchDecoder):
+            last_conv = self.decoder.post_conv[-1]
+            assert isinstance(last_conv, nn.Conv2d)
             nn.init.zeros_(last_conv.weight)
             if last_conv.bias is not None:
                 nn.init.zeros_(last_conv.bias)
@@ -486,8 +653,8 @@ class MultiLevelFluidModel(nn.Module):
         B = x.size(0)
         P = self.n_patches
 
-        # Multi-scale skip features from raw input (before patch projection)
-        skip_feats = self.skip_encoder(x)
+        # Multi-scale skip features from raw input (only used by PerLevelDecoder)
+        skip_feats = self.skip_encoder(x) if self.skip_encoder is not None else None
 
         # Shared patch features, projected differently per level
         base   = self.patch_embed(x)                                      # (B, P, d)
