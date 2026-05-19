@@ -395,33 +395,22 @@ class OverlappingPatchDecoder(nn.Module):
             nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
         )
 
-        # ---- weight kernel (tent / bilinear) --------------------------------
-        # Pixel centres sit at 0.5, 1.5, … within the (kernel × kernel) patch.
-        # The patch centre in continuous coords is kernel / 2 = 3p/4.
-        # Tent half-width equals kernel / 2 so the weight reaches 0.5 at each edge.
-        coords = torch.arange(kernel).float() + 0.5       # (kernel,)
-        centre = kernel / 2.0                              # = 3p/4
-        w1d    = (centre - (coords - centre).abs()).clamp(min=0)  # tent
-        wk_2d  = w1d.unsqueeze(1) * w1d.unsqueeze(0)      # (kernel, kernel)
-        self.register_buffer('weight_kernel', wk_2d)
-
-        # ---- pre-compute normalization denominator --------------------------
-        # fold the weight kernel (one channel, one block per patch) to get the
-        # per-pixel sum of tent weights; dividing by this gives the normalized
-        # weighted average.
-        wk_flat = wk_2d.flatten()                          # (kernel²,)
-        norm_in = wk_flat.unsqueeze(0).unsqueeze(-1).expand(1, -1, n * n)  # (1, kernel², n²)
-        norm = F.fold(
-            norm_in.contiguous(),
+        # ---- pre-compute overlap count map ---------------------------------
+        # Fold uniform ones to get the number of patches covering each pixel.
+        # Dividing by this gives a simple uniform average: every overlapping
+        # patch contributes equally, so backprop gives each patch equal gradient
+        # from every pixel it covers (no tent down-weighting of edge regions).
+        ones_in = torch.ones(1, kernel * kernel, n * n)
+        overlap_count = F.fold(
+            ones_in,
             output_size=(img_size, img_size),
             kernel_size=kernel,
             stride=patch_size,
             padding=patch_size // 4,
         )                                                  # (1, 1, H, W)
-        self.register_buffer('norm_map', norm)
+        self.register_buffer('overlap_count', overlap_count)
 
-    weight_kernel: torch.Tensor
-    norm_map: torch.Tensor
+    overlap_count: torch.Tensor
 
     def forward(
         self,
@@ -447,14 +436,11 @@ class OverlappingPatchDecoder(nn.Module):
             patch_preds = patch_preds + w.unsqueeze(-1) * f_k
         patch_preds = patch_preds / n_levels                  # (B, P, C·kernel²)
 
-        # Apply tent weights to every patch's pixel predictions
-        # (B, P, C, kernel²) → multiply by (kernel²,) → rearrange to (B, C·kernel², P)
-        wk_flat     = self.weight_kernel.flatten()            # (kernel²,)
-        patch_preds = patch_preds.reshape(B, P, C, kernel * kernel)
-        patch_preds = patch_preds * wk_flat                   # broadcast over B, P, C
-        patch_preds = patch_preds.permute(0, 2, 3, 1).reshape(B, C * kernel * kernel, P)
+        # Rearrange to (B, C·kernel², P) for fold
+        patch_preds = patch_preds.permute(0, 2, 1).reshape(B, C * kernel * kernel, P)
 
-        # Fold weighted predictions into image space
+        # Fold: sum all patch predictions into image space, then divide by how
+        # many patches cover each pixel → uniform average, full gradient to all
         output = F.fold(
             patch_preds.contiguous(),
             output_size=(self.img_size, self.img_size),
@@ -462,9 +448,7 @@ class OverlappingPatchDecoder(nn.Module):
             stride=p,
             padding=p // 4,
         )                                                      # (B, C, H, W)
-
-        # Divide by pre-computed weight denominator → normalized weighted average
-        output = output / self.norm_map.to(output.device).clamp(min=1e-6)
+        output = output / self.overlap_count.clamp(min=1e-6)
 
         # Residual spatial refinement via post-fold CNN
         if self.skip_ch > 0 and skip_feats is not None and len(skip_feats) > 0:
