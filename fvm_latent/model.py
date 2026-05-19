@@ -387,29 +387,44 @@ class OverlappingPatchDecoder(nn.Module):
             for _ in range(n_levels)
         ])
 
-        # Post-fold spatial refinement CNN (residual correction)
+        # Post-fold spatial refinement: dilated conv stack with RF = 31px.
+        # Dilations 1→2→4→8 span a full patch stride (16px) so the network can
+        # reconcile adjacent patch predictions, not just smooth the 4px seam.
+        # RF per layer: 3 → 7 → 15 → 31.  Final 1×1 projects back to C channels.
         mid = max(out_channels * 8, 64)
         self.post_conv = nn.Sequential(
-            nn.Conv2d(out_channels + skip_ch, mid, 3, padding=1, padding_mode='replicate'),
+            nn.Conv2d(out_channels + skip_ch, mid, 3, padding=1,  dilation=1, padding_mode='replicate'),
             nn.GELU(),
-            nn.Conv2d(mid, out_channels, 3, padding=1, padding_mode='replicate'),
+            nn.Conv2d(mid, mid, 3, padding=2,  dilation=2, padding_mode='replicate'),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, 3, padding=4,  dilation=4, padding_mode='replicate'),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, 3, padding=8,  dilation=8, padding_mode='replicate'),
+            nn.GELU(),
+            nn.Conv2d(mid, out_channels, 1),
         )
 
+        # ---- scatter kernel: MPS-compatible replacement for F.fold -----------
+        # F.fold (col2im) is not implemented on MPS and falls back to CPU.
+        # conv_transpose2d with this identity-scatter kernel is mathematically
+        # identical: input channel ky*k+kx is placed at kernel offset (ky, kx).
+        k = kernel
+        scatter_w = torch.zeros(k * k, 1, k, k)
+        for ky in range(k):
+            for kx in range(k):
+                scatter_w[ky * k + kx, 0, ky, kx] = 1.0
+        self.register_buffer('scatter_weight', scatter_w)
+
         # ---- pre-compute overlap count map ---------------------------------
-        # Fold uniform ones to get the number of patches covering each pixel.
-        # Dividing by this gives a simple uniform average: every overlapping
-        # patch contributes equally, so backprop gives each patch equal gradient
-        # from every pixel it covers (no tent down-weighting of edge regions).
-        ones_in = torch.ones(1, kernel * kernel, n * n)
-        overlap_count = F.fold(
-            ones_in,
-            output_size=(img_size, img_size),
-            kernel_size=kernel,
-            stride=patch_size,
-            padding=patch_size // 4,
+        # How many patches cover each pixel — used to normalise the fold sum.
+        # Computed once with conv_transpose2d (no F.fold anywhere at runtime).
+        ones = torch.ones(1 * 1, k * k, n, n)
+        overlap_count = F.conv_transpose2d(
+            ones, scatter_w, stride=patch_size, padding=patch_size // 4,
         )                                                  # (1, 1, H, W)
         self.register_buffer('overlap_count', overlap_count)
 
+    scatter_weight: torch.Tensor
     overlap_count: torch.Tensor
 
     def forward(
@@ -436,18 +451,18 @@ class OverlappingPatchDecoder(nn.Module):
             patch_preds = patch_preds + w.unsqueeze(-1) * f_k
         patch_preds = patch_preds / n_levels                  # (B, P, C·kernel²)
 
-        # Rearrange to (B, C·kernel², P) for fold
-        patch_preds = patch_preds.permute(0, 2, 1).reshape(B, C * kernel * kernel, P)
-
-        # Fold: sum all patch predictions into image space, then divide by how
-        # many patches cover each pixel → uniform average, full gradient to all
-        output = F.fold(
-            patch_preds.contiguous(),
-            output_size=(self.img_size, self.img_size),
-            kernel_size=kernel,
-            stride=p,
-            padding=p // 4,
-        )                                                      # (B, C, H, W)
+        # Scatter patches into image space via conv_transpose2d (MPS-compatible).
+        # Rearrange (B, P, C*k²) → (B*C, k², n, n) then scatter each channel
+        # independently; reshape result back to (B, C, H, W).
+        n = self.n_per_side
+        patch_bc = (
+            patch_preds.permute(0, 2, 1)                         # (B, C*k², P)
+                       .reshape(B, C, kernel * kernel, n, n)     # (B, C, k², n, n)
+                       .reshape(B * C, kernel * kernel, n, n)    # (B*C, k², n, n)
+        )
+        output = F.conv_transpose2d(
+            patch_bc, self.scatter_weight, stride=p, padding=p // 4,
+        ).reshape(B, C, self.img_size, self.img_size)            # (B, C, H, W)
         output = output / self.overlap_count.clamp(min=1e-6)
 
         # Residual spatial refinement via post-fold CNN
@@ -561,13 +576,16 @@ class MultiLevelFluidModel(nn.Module):
 
         n_doublings = int(math.log2(patch_size))
 
-        # Shared patch embedding — extracts local patch features once
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels * window_size, d_model)
-
-        # Per-level linear projections — each level gets a distinct learned readout
-        self.level_projs = nn.ModuleList([
-            nn.Linear(d_model, d_model) for _ in range(n_levels)
+        # Per-level patch embeddings — each level has its own Conv2d so levels
+        # can extract genuinely different spatial features from the raw input.
+        self.patch_embeds = nn.ModuleList([
+            PatchEmbed(img_size, patch_size, in_channels * window_size, d_model)
+            for _ in range(n_levels)
         ])
+
+        # Learnable per-level decoder contribution weights (softmaxed).
+        # Initialised to zero → uniform 1/K at the start of training.
+        self.level_gate_logits = nn.Parameter(torch.zeros(n_levels))
 
         # Transformer with 2D RoPE and axial+cross-level mask
         self.transformer = HierarchicalTransformer(d_model, n_heads, n_transformer_layers, n, dropout)
@@ -640,10 +658,9 @@ class MultiLevelFluidModel(nn.Module):
         # Multi-scale skip features from raw input (only used by PerLevelDecoder)
         skip_feats = self.skip_encoder(x) if self.skip_encoder is not None else None
 
-        # Shared patch features, projected differently per level
-        base   = self.patch_embed(x)                                      # (B, P, d)
+        # Per-level patch features — independent Conv2d projections of the input
         tokens = torch.cat(
-            [self.level_projs[k](base) for k in range(n_levels)],
+            [self.patch_embeds[k](x) for k in range(n_levels)],
             dim=1,
         )                                                                  # (B, K*P, d)
 
@@ -664,8 +681,10 @@ class MultiLevelFluidModel(nn.Module):
             mask = self._mask_cache[n_levels].to(x.device)
         out = self.transformer(tokens, mask, n_levels)   # (B, K*P, d)
 
-        weights = torch.ones(B, n_levels * P, device=x.device)
-        pred    = self.decoder(out, weights, skip_feats) # (B, C, H, W)
+        # Softmax'd per-level weights, broadcast across patches
+        w       = torch.softmax(self.level_gate_logits[:n_levels], dim=0)  # (n_levels,)
+        weights = w.repeat_interleave(P).unsqueeze(0).expand(B, -1)        # (B, K*P)
+        pred    = self.decoder(out, weights, skip_feats)                   # (B, C, H, W)
 
         return {'pred': pred}
 
