@@ -147,7 +147,8 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
         # Build per-run overrides: mu_b first, then any extra user overrides
         # (extra overrides can themselves override mu_b if desired)
         overrides = {"visc_bulk": mu_b, "plot": False, "exact_interval": True, "save_t": sweep_cfg.save_t,
-                     "n_iter": sweep_cfg.n_iter, "save_dir": run_save_dir, **sweep_cfg.phys_overrides}
+                     "n_iter": sweep_cfg.n_iter, "end_t": sweep_cfg.end_t,
+                     "save_dir": run_save_dir, **sweep_cfg.phys_overrides}
         cfg = apply_overrides(base_cfg, overrides)
 
         phy_setup = PhysicalSetup(cfg)
