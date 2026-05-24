@@ -93,8 +93,7 @@ def _render_frame_rgb(
 
     fig.tight_layout()
     fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3).copy()
+    img = np.array(fig.canvas.buffer_rgba())[:, :, :3]  # RGBA → RGB
     plt.close(fig)
     return img
 
