@@ -38,6 +38,7 @@ Navigation
 
 import os
 import sys
+import tempfile
 import argparse
 from pathlib import Path
 
@@ -51,6 +52,80 @@ from renderer import MeshRenderer
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 RESOLUTION  = (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# Video export helpers
+# ---------------------------------------------------------------------------
+
+def _render_frame_rgb(
+    rows: list[tuple[str, np.ndarray]],
+    view_mode: str,
+    prev_rows: list[np.ndarray] | None = None,
+    zranges: list[tuple[float, float]] | None = None,
+    title: str = '',
+) -> np.ndarray:
+    """Render one video frame (one or two rows of 4 fields) as RGB [H, W, 3]."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    n_rows = len(rows)
+    fig, axes = plt.subplots(n_rows, 4, figsize=(16, 4 * n_rows), squeeze=False)
+
+    for ri, (label, grid) in enumerate(rows):
+        prev = prev_rows[ri] if prev_rows else None
+        for ci in range(4):
+            ax = axes[ri, ci]
+            if view_mode == 'delta' and prev is not None:
+                data   = grid[ci] - prev[ci]
+                maxabs = float(np.abs(data).max()) or 1.0
+                im = ax.imshow(data, cmap='RdBu_r', vmin=-maxabs, vmax=maxabs, origin='upper')
+            else:
+                zmin, zmax = zranges[ci] if zranges else (None, None)
+                im = ax.imshow(grid[ci], cmap='viridis', vmin=zmin, vmax=zmax, origin='upper')
+            ax.set_title(f'{label}  {FIELD_NAMES[ci]}', fontsize=9, pad=3)
+            ax.axis('off')
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    if title:
+        fig.suptitle(title, fontsize=10)
+
+    fig.tight_layout()
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3).copy()
+    plt.close(fig)
+    return img
+
+
+def _frames_to_video_bytes(frames: list[np.ndarray], fps: int = 8) -> bytes:
+    """Encode RGB frames [H, W, 3] to MP4 bytes. Requires imageio + imageio-ffmpeg."""
+    try:
+        import imageio
+    except ImportError:
+        raise RuntimeError(
+            'imageio is required for video export.\n'
+            'Install with:  pip install imageio imageio-ffmpeg'
+        )
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
+        tmp = f.name
+    try:
+        writer = imageio.get_writer(
+            tmp, fps=fps, codec='libx264',
+            output_params=['-crf', '23', '-pix_fmt', 'yuv420p'],
+        )
+        for frame in frames:
+            h, w = frame.shape[:2]
+            if h % 2: frame = frame[:h - 1]
+            if w % 2: frame = frame[:, :w - 1]
+            writer.append_data(frame)
+        writer.close()
+        with open(tmp, 'rb') as f:
+            return f.read()
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +284,16 @@ def _nav_bar() -> html.Div:
                        tooltip={"placement": "bottom", "always_visible": True}),
             style={"flex": "1", "margin": "0 20px"},
         ),
+        dcc.Loading(
+            html.Div([
+                html.Button("⬇ Download Video", id="btn-download-video", n_clicks=0,
+                            style={"fontSize": "12px", "padding": "5px 14px", "cursor": "pointer",
+                                   "borderRadius": "4px", "border": "1px solid #aaa", "background": "#fff"}),
+                html.Span(id="video-status", style={"fontSize": "11px", "color": "#555", "marginLeft": "6px"}),
+            ], style={"display": "flex", "alignItems": "center"}),
+            type="dot",
+        ),
+        dcc.Download(id="video-download"),
     ], style={"display": "flex", "alignItems": "center", "padding": "8px 12px",
               "borderTop": "1px solid #ddd"})
 
@@ -342,6 +427,50 @@ def build_app(root_dir: str) -> dash.Dash:
         n      = len(files)
         header = f"{os.path.basename(run_dir)}   |   step {step_idx + 1}/{n}   |   t = {t:.4g}"
         return (*figs, row_label, header, n - 1, step_idx)
+
+    @app.callback(
+        Output("video-download", "data"),
+        Output("video-status",   "children"),
+        Input("btn-download-video", "n_clicks"),
+        State("state",     "data"),
+        State("view-mode", "data"),
+        prevent_initial_call=True,
+    )
+    def download_video(_n, state, view_mode):
+        run_dir = run_dirs[state["run_idx"]]
+        files   = all_files[run_dir]
+        name    = os.path.basename(run_dir)
+        print(f'Generating video for {name} ({len(files)} frames)...')
+
+        grids = []
+        ts    = []
+        for path in files:
+            t, cell_prims = load_step(path)
+            grids.append(renderers[run_dir].render_cell_smooth(cell_prims).numpy())
+            ts.append(t)
+
+        if view_mode == 'absolute':
+            zranges = [
+                (float(min(g[i].min() for g in grids)), float(max(g[i].max() for g in grids)))
+                for i in range(4)
+            ]
+        else:
+            zranges = None
+
+        frames = []
+        for i, (grid, t) in enumerate(zip(grids, ts)):
+            prev = [grids[i - 1]] if i > 0 else None
+            frames.append(_render_frame_rgb(
+                rows=[('', grid)],
+                view_mode=view_mode,
+                prev_rows=prev,
+                zranges=zranges,
+                title=f'{name}   t = {t:.4g}',
+            ))
+
+        video_bytes = _frames_to_video_bytes(frames)
+        print(f'Video ready ({len(video_bytes) // 1024} KB)')
+        return dcc.send_bytes(video_bytes, filename=f'{name}.mp4'), ''
 
     return app
 
@@ -523,6 +652,58 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
             bot_label = "Generated"
 
         return (*top_figs, *bot_figs, top_label, bot_label, header, n - 1, step_idx)
+
+    @app.callback(
+        Output("video-download", "data"),
+        Output("video-status",   "children"),
+        Input("btn-download-video", "n_clicks"),
+        State("state",     "data"),
+        State("view-mode", "data"),
+        prevent_initial_call=True,
+    )
+    def download_video(_n, state, view_mode):
+        run_idx  = state["run_idx"]
+        real_dir = real_run_dirs[run_idx]
+        gen_dir  = gen_run_dirs[run_idx]
+        gen_files  = gen_files_map[gen_dir]
+        real_files = real_files_map[real_dir]
+        name       = run_names[run_idx]
+        print(f'Generating comparison video for {name} ({len(gen_files)} frames)...')
+
+        real_grids, gen_grids, ts = [], [], []
+        for gf in gen_files:
+            t, gg, _ = load_gen_frame(gf)
+            ri = closest_idx(real_files, t)
+            _, rcp = load_step(real_files[ri])
+            real_grids.append(renderers[real_dir].render_cell_smooth(rcp).numpy())
+            gen_grids.append(gg)
+            ts.append(t)
+
+        if view_mode == 'absolute':
+            all_grids = real_grids + gen_grids
+            zranges = [
+                (float(min(g[i].min() for g in all_grids)), float(max(g[i].max() for g in all_grids)))
+                for i in range(4)
+            ]
+        else:
+            zranges = None
+
+        frames = []
+        for i, t in enumerate(ts):
+            prev_real = real_grids[i - 1] if i > 0 else None
+            prev_gen  = gen_grids[i - 1]  if i > 0 else None
+            prev_rows = [prev_real, prev_gen] if (view_mode == 'delta' and i > 0) else None
+            frames.append(_render_frame_rgb(
+                rows=[('Real', real_grids[i]), ('Generated', gen_grids[i])],
+                view_mode=view_mode,
+                prev_rows=prev_rows,
+                zranges=zranges,
+                title=f'{name}   t = {t:.4g}',
+            ))
+
+        video_bytes = _frames_to_video_bytes(frames)
+        print(f'Video ready ({len(video_bytes) // 1024} KB)')
+        return dcc.send_bytes(video_bytes, filename=f'{name}_comparison.mp4'), ''
 
     return app
 
