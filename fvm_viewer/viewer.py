@@ -58,6 +58,18 @@ RESOLUTION  = (512, 512)
 # Video export helpers
 # ---------------------------------------------------------------------------
 
+def _apply_cmap(data: np.ndarray, cmap_name: str,
+                vmin: float, vmax: float, out_w: int, out_h: int) -> np.ndarray:
+    """Apply a colormap to a 2D array; returns uint8 RGB [out_h, out_w, 3]."""
+    from matplotlib import colormaps
+    from PIL import Image
+    norm = np.clip((data.astype(np.float32) - vmin) / max(vmax - vmin, 1e-8), 0, 1)
+    rgb  = (colormaps[cmap_name](norm)[:, :, :3] * 255).astype(np.uint8)
+    if rgb.shape[:2] != (out_h, out_w):
+        rgb = np.array(Image.fromarray(rgb).resize((out_w, out_h), Image.BILINEAR))
+    return rgb
+
+
 def _render_frame_rgb(
     rows: list[tuple[str, np.ndarray]],
     view_mode: str,
@@ -65,59 +77,95 @@ def _render_frame_rgb(
     zranges: list[tuple[float, float]] | None = None,
     title: str = '',
 ) -> np.ndarray:
-    """Render one video frame (one or two rows of 4 fields) as RGB [H, W, 3]."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    """Render one video frame as RGB [H, W, 3] using PIL — no matplotlib figure."""
+    from PIL import Image, ImageDraw
 
-    n_rows = len(rows)
-    fig, axes = plt.subplots(n_rows, 4, figsize=(16, 4 * n_rows), squeeze=False)
+    CELL_W, CELL_H = 256, 256
+    BAR_H   = 22
+    TITLE_H = 28 if title else 0
+    total_w = 4 * CELL_W
+    total_h = TITLE_H + len(rows) * (BAR_H + CELL_H)
+
+    canvas = Image.new('RGB', (total_w, total_h), (24, 24, 24))
+    draw   = ImageDraw.Draw(canvas)
+
+    if title:
+        draw.text((total_w // 2, TITLE_H // 2), title, fill=(210, 210, 210), anchor='mm')
 
     for ri, (label, grid) in enumerate(rows):
-        prev = prev_rows[ri] if prev_rows else None
+        prev  = prev_rows[ri] if prev_rows else None
+        y_bar = TITLE_H + ri * (BAR_H + CELL_H)
+        y_img = y_bar + BAR_H
+        draw.rectangle([0, y_bar, total_w, y_bar + BAR_H - 1], fill=(45, 45, 45))
+        draw.text((6, y_bar + BAR_H // 2), label, fill=(180, 180, 220), anchor='lm')
+
         for ci in range(4):
-            ax = axes[ri, ci]
+            x0 = ci * CELL_W
             if view_mode == 'delta' and prev is not None:
                 data   = grid[ci] - prev[ci]
                 maxabs = float(np.abs(data).max()) or 1.0
-                im = ax.imshow(data, cmap='RdBu_r', vmin=-maxabs, vmax=maxabs, origin='upper')
+                thumb  = _apply_cmap(data, 'RdBu_r', -maxabs, maxabs, CELL_W, CELL_H)
             else:
-                zmin, zmax = zranges[ci] if zranges else (None, None)
-                im = ax.imshow(grid[ci], cmap='viridis', vmin=zmin, vmax=zmax, origin='upper')
-            ax.set_title(f'{label}  {FIELD_NAMES[ci]}', fontsize=9, pad=3)
-            ax.axis('off')
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                zmin, zmax = zranges[ci] if zranges else (float(grid[ci].min()), float(grid[ci].max()))
+                thumb  = _apply_cmap(grid[ci], 'viridis', zmin, zmax, CELL_W, CELL_H)
+            canvas.paste(Image.fromarray(thumb), (x0, y_img))
+            draw.text((x0 + 4, y_img + 4), FIELD_NAMES[ci], fill=(255, 255, 255))
 
-    if title:
-        fig.suptitle(title, fontsize=10)
+    return np.array(canvas)
 
-    fig.tight_layout()
-    fig.canvas.draw()
-    img = np.array(fig.canvas.buffer_rgba())[:, :, :3]  # RGBA → RGB
-    plt.close(fig)
-    return img
+
+class _CV2Writer:
+    """cv2.VideoWriter wrapper with lazy init (dimensions known at first frame)."""
+
+    def __init__(self, path: str, fps: int):
+        import cv2
+        self._cv2    = cv2
+        self._path   = path
+        self._fps    = fps
+        self._writer = None
+        self._wh: tuple[int, int] | None = None
+
+    def append_data(self, frame: np.ndarray) -> None:
+        h, w = frame.shape[:2]
+        if h % 2: h -= 1
+        if w % 2: w -= 1
+        if self._writer is None:
+            self._wh     = (w, h)
+            self._writer = self._cv2.VideoWriter(
+                self._path, self._cv2.VideoWriter_fourcc(*'mp4v'), self._fps, (w, h)
+            )
+        frame = frame[:h, :w]
+        self._writer.write(self._cv2.cvtColor(frame, self._cv2.COLOR_RGB2BGR))
+
+    def close(self) -> None:
+        if self._writer:
+            self._writer.release()
 
 
 def _open_video_writer(tmp_path: str, fps: int = 8):
-    """Open an imageio MP4 writer. Requires imageio + imageio-ffmpeg."""
+    """Return a writer that supports .append_data(frame) and .close().
+
+    Tries cv2 first (C extension, no fork), then imageio-ffmpeg.
+    """
+    try:
+        import cv2  # noqa: F401
+        return _CV2Writer(tmp_path, fps)
+    except ImportError:
+        pass
     try:
         import imageio
-    except ImportError:
-        raise RuntimeError(
-            'imageio is required for video export.\n'
-            'Install with:  pip install imageio imageio-ffmpeg'
+        return imageio.get_writer(
+            tmp_path, fps=fps, codec='libx264',
+            output_params=['-crf', '23', '-pix_fmt', 'yuv420p'],
         )
-    return imageio.get_writer(
-        tmp_path, fps=fps, codec='libx264',
-        output_params=['-crf', '23', '-pix_fmt', 'yuv420p'],
-    )
+    except Exception as e:
+        raise RuntimeError(
+            f'No video encoder available ({e}).\n'
+            'Install opencv-python:  pip install opencv-python-headless'
+        )
 
 
 def _append_frame(writer, frame: np.ndarray) -> None:
-    """Write one RGB frame, ensuring even dimensions for yuv420p."""
-    h, w = frame.shape[:2]
-    if h % 2: frame = frame[:h - 1]
-    if w % 2: frame = frame[:, :w - 1]
     writer.append_data(frame)
 
 
