@@ -38,7 +38,6 @@ Navigation
 
 import os
 import sys
-import tempfile
 import argparse
 from pathlib import Path
 
@@ -126,26 +125,18 @@ def _render_frame_rgb(
     return np.array(canvas)
 
 
-def _open_video_writer(tmp_path: str, fps: int = 8):
-    """Open an imageio MP4 writer. Requires imageio + imageio-ffmpeg."""
-    try:
-        import imageio
-    except ImportError:
-        raise RuntimeError(
-            'imageio is required for video export.\n'
-            'Install with:  pip install imageio imageio-ffmpeg'
-        )
-    return imageio.get_writer(
-        tmp_path, fps=fps, codec='libx264',
-        output_params=['-crf', '23', '-pix_fmt', 'yuv420p'],
+def _encode_apng(frames: list[np.ndarray], fps: int = 8) -> bytes:
+    """Encode RGB frames as an animated PNG (APNG) — pure PIL, no subprocess/fork."""
+    import io
+    from PIL import Image
+    imgs = [Image.fromarray(f) for f in frames]
+    buf  = io.BytesIO()
+    imgs[0].save(
+        buf, format='PNG', save_all=True,
+        append_images=imgs[1:],
+        loop=0, duration=int(1000 / fps),
     )
-
-
-def _append_frame(writer, frame: np.ndarray) -> None:
-    h, w = frame.shape[:2]
-    if h % 2: frame = frame[:h - 1]
-    if w % 2: frame = frame[:, :w - 1]
-    writer.append_data(frame)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -475,33 +466,24 @@ def build_app(root_dir: str) -> dash.Dash:
                     maxs[i] = max(maxs[i], float(g[i].max()))
             zranges = list(zip(mins, maxs))
 
-        # Pass 2: render and write one frame at a time
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
-            tmp = f.name
-        try:
-            writer   = _open_video_writer(tmp)
-            prev_grid = None
-            for path in files:
-                t, cp = load_step(path)
-                grid  = renderers[run_dir].render_cell_smooth(cp).numpy()
-                frame = _render_frame_rgb(
-                    rows=[('', grid)],
-                    view_mode=view_mode,
-                    prev_rows=[prev_grid] if (view_mode == 'delta' and prev_grid is not None) else None,
-                    zranges=zranges,
-                    title=f'{name}   t = {t:.4g}',
-                )
-                _append_frame(writer, frame)
-                prev_grid = grid
-            writer.close()
-            with open(tmp, 'rb') as f:
-                video_bytes = f.read()
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        # Pass 2: render frames (each ~1.8 MB as PIL — safe to accumulate)
+        frames: list[np.ndarray] = []
+        prev_grid = None
+        for path in files:
+            t, cp = load_step(path)
+            grid  = renderers[run_dir].render_cell_smooth(cp).numpy()
+            frames.append(_render_frame_rgb(
+                rows=[('', grid)],
+                view_mode=view_mode,
+                prev_rows=[prev_grid] if (view_mode == 'delta' and prev_grid is not None) else None,
+                zranges=zranges,
+                title=f'{name}   t = {t:.4g}',
+            ))
+            prev_grid = grid
 
-        print(f'Video ready ({len(video_bytes) // 1024} KB)')
-        return dcc.send_bytes(video_bytes, filename=f'{name}.mp4'), ''
+        video_bytes = _encode_apng(frames)
+        print(f'APNG ready ({len(video_bytes) // 1024} KB)')
+        return dcc.send_bytes(video_bytes, filename=f'{name}.png'), ''
 
     return app
 
@@ -716,38 +698,28 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
                     maxs[i] = max(maxs[i], float(gg[i].max()), float(rg[i].max()))
             zranges = list(zip(mins, maxs))
 
-        # Pass 2: render and write one frame at a time
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
-            tmp = f.name
-        try:
-            writer    = _open_video_writer(tmp)
-            prev_real = None
-            prev_gen  = None
-            for gf in gen_files:
-                t, gg, _ = load_gen_frame(gf)
-                ri = closest_idx(real_files, t)
-                _, rcp = load_step(real_files[ri])
-                rg = renderers[real_dir].render_cell_smooth(rcp).numpy()
-                prev_rows = ([prev_real, prev_gen]
-                             if (view_mode == 'delta' and prev_real is not None) else None)
-                frame = _render_frame_rgb(
-                    rows=[('Real', rg), ('Generated', gg)],
-                    view_mode=view_mode,
-                    prev_rows=prev_rows,
-                    zranges=zranges,
-                    title=f'{name}   t = {t:.4g}',
-                )
-                _append_frame(writer, frame)
-                prev_real, prev_gen = rg, gg
-            writer.close()
-            with open(tmp, 'rb') as f:
-                video_bytes = f.read()
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        # Pass 2: render frames (each ~1.8 MB as PIL — safe to accumulate)
+        frames: list[np.ndarray] = []
+        prev_real = prev_gen = None
+        for gf in gen_files:
+            t, gg, _ = load_gen_frame(gf)
+            ri = closest_idx(real_files, t)
+            _, rcp = load_step(real_files[ri])
+            rg = renderers[real_dir].render_cell_smooth(rcp).numpy()
+            prev_rows = ([prev_real, prev_gen]
+                         if (view_mode == 'delta' and prev_real is not None) else None)
+            frames.append(_render_frame_rgb(
+                rows=[('Real', rg), ('Generated', gg)],
+                view_mode=view_mode,
+                prev_rows=prev_rows,
+                zranges=zranges,
+                title=f'{name}   t = {t:.4g}',
+            ))
+            prev_real, prev_gen = rg, gg
 
-        print(f'Video ready ({len(video_bytes) // 1024} KB)')
-        return dcc.send_bytes(video_bytes, filename=f'{name}_comparison.mp4'), ''
+        video_bytes = _encode_apng(frames)
+        print(f'APNG ready ({len(video_bytes) // 1024} KB)')
+        return dcc.send_bytes(video_bytes, filename=f'{name}_comparison.png'), ''
 
     return app
 
