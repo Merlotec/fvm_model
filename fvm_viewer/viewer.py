@@ -53,6 +53,13 @@ from renderer import MeshRenderer
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 RESOLUTION  = (512, 512)
 
+# Colormap LUTs precomputed once at startup — safe to use from any thread.
+def _build_lut(name: str) -> np.ndarray:
+    from matplotlib import colormaps
+    return (colormaps[name](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
+
+_LUT: dict[str, np.ndarray] = {}   # populated lazily on first use, before any Dash callbacks
+
 
 # ---------------------------------------------------------------------------
 # Video export helpers
@@ -60,13 +67,18 @@ RESOLUTION  = (512, 512)
 
 def _apply_cmap(data: np.ndarray, cmap_name: str,
                 vmin: float, vmax: float, out_w: int, out_h: int) -> np.ndarray:
-    """Apply a colormap to a 2D array; returns uint8 RGB [out_h, out_w, 3]."""
-    from matplotlib import colormaps
+    """Apply a precomputed colormap LUT; returns uint8 RGB [out_h, out_w, 3].
+    Pure numpy — safe to call from any thread, no matplotlib in the hot path.
+    """
     from PIL import Image
+    if cmap_name not in _LUT:
+        _LUT[cmap_name] = _build_lut(cmap_name)
+    lut  = _LUT[cmap_name]
     norm = np.clip((data.astype(np.float32) - vmin) / max(vmax - vmin, 1e-8), 0, 1)
-    rgb  = (colormaps[cmap_name](norm)[:, :, :3] * 255).astype(np.uint8)
+    idx  = (norm * 255).astype(np.uint8)
+    rgb  = lut[idx]                                        # [H, W, 3] uint8
     if rgb.shape[:2] != (out_h, out_w):
-        rgb = np.array(Image.fromarray(rgb).resize((out_w, out_h), Image.BILINEAR))
+        rgb = np.array(Image.fromarray(rgb).resize((out_w, out_h), Image.Resampling.BILINEAR))
     return rgb
 
 
@@ -114,58 +126,25 @@ def _render_frame_rgb(
     return np.array(canvas)
 
 
-class _CV2Writer:
-    """cv2.VideoWriter wrapper with lazy init (dimensions known at first frame)."""
-
-    def __init__(self, path: str, fps: int):
-        import cv2
-        self._cv2    = cv2
-        self._path   = path
-        self._fps    = fps
-        self._writer = None
-        self._wh: tuple[int, int] | None = None
-
-    def append_data(self, frame: np.ndarray) -> None:
-        h, w = frame.shape[:2]
-        if h % 2: h -= 1
-        if w % 2: w -= 1
-        if self._writer is None:
-            self._wh     = (w, h)
-            self._writer = self._cv2.VideoWriter(
-                self._path, self._cv2.VideoWriter_fourcc(*'mp4v'), self._fps, (w, h)
-            )
-        frame = frame[:h, :w]
-        self._writer.write(self._cv2.cvtColor(frame, self._cv2.COLOR_RGB2BGR))
-
-    def close(self) -> None:
-        if self._writer:
-            self._writer.release()
-
-
 def _open_video_writer(tmp_path: str, fps: int = 8):
-    """Return a writer that supports .append_data(frame) and .close().
-
-    Tries cv2 first (C extension, no fork), then imageio-ffmpeg.
-    """
-    try:
-        import cv2  # noqa: F401
-        return _CV2Writer(tmp_path, fps)
-    except ImportError:
-        pass
+    """Open an imageio MP4 writer. Requires imageio + imageio-ffmpeg."""
     try:
         import imageio
-        return imageio.get_writer(
-            tmp_path, fps=fps, codec='libx264',
-            output_params=['-crf', '23', '-pix_fmt', 'yuv420p'],
-        )
-    except Exception as e:
+    except ImportError:
         raise RuntimeError(
-            f'No video encoder available ({e}).\n'
-            'Install opencv-python:  pip install opencv-python-headless'
+            'imageio is required for video export.\n'
+            'Install with:  pip install imageio imageio-ffmpeg'
         )
+    return imageio.get_writer(
+        tmp_path, fps=fps, codec='libx264',
+        output_params=['-crf', '23', '-pix_fmt', 'yuv420p'],
+    )
 
 
 def _append_frame(writer, frame: np.ndarray) -> None:
+    h, w = frame.shape[:2]
+    if h % 2: frame = frame[:h - 1]
+    if w % 2: frame = frame[:, :w - 1]
     writer.append_data(frame)
 
 
@@ -789,6 +768,10 @@ def main():
     parser.add_argument("--host", default="127.0.0.1",
                         help="127.0.0.1 for SSH port-forwarding, 0.0.0.0 for direct access")
     args = parser.parse_args()
+
+    # Pre-build colormap LUTs on the main thread before Dash starts
+    for _cmap in ('viridis', 'RdBu_r'):
+        _LUT[_cmap] = _build_lut(_cmap)
 
     if args.compare:
         app = build_compare_app(args.directory, args.compare)
