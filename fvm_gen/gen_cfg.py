@@ -1,15 +1,18 @@
 """
 Configuration for fvm_gen dataset generation sweeps.
 
-PhysicalSetup can be overridden by passing `phys_overrides` — a dict of
-ConfigFVM physical-parameter field names to new values.  Any field on
-ConfigFVM is valid (e.g. visc_bulk, viscosity, gamma, …).
+Each run independently samples from `param_specs` — a dict mapping
+parameter names to a sampling specification:
 
-mu_b sourcing (mutually exclusive):
-  - Set mu_b_values explicitly, OR
-  - Set mu_b_values=null and provide mu_b_gen_count, mu_b_gen_mean, mu_b_gen_stdev
-    to sample from a log-normal distribution:
-        log(mu_b) ~ Normal(mu_b_gen_mean, mu_b_gen_stdev)
+  {"dist": "lognormal", "mean": <float>, "std": <float>}
+  {"dist": "uniform",   "low":  <float>, "high": <float>}
+  {"values": [<float>, ...]}   # explicit list; must have exactly n_samples entries
+
+Directly settable ConfigFVM fields:
+  visc_bulk, viscosity, thermal_cond, C_v, gamma, T_0, v_factor, lim_K, ...
+
+Special parameter handled via BC configs:
+  rho_inf  — applied to both inlet_cfg.rho_inf and exit_cfg.rho_inf
 """
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,48 +20,51 @@ from typing import Any
 import numpy as np
 
 
+def _sample_param(name: str, spec: dict, n: int, rng: np.random.Generator) -> list[float]:
+    if "values" in spec:
+        vals = list(spec["values"])
+        if len(vals) != n:
+            raise ValueError(
+                f"param '{name}': values list has {len(vals)} entries but n_samples={n}"
+            )
+        return vals
+    dist = spec.get("dist", "lognormal")
+    if dist == "lognormal":
+        return np.exp(rng.normal(spec["mean"], spec["std"], size=n)).tolist()
+    elif dist == "uniform":
+        return rng.uniform(spec["low"], spec["high"], size=n).tolist()
+    else:
+        raise ValueError(f"param '{name}': unknown dist '{dist}'. Use 'lognormal' or 'uniform'.")
+
+
 @dataclass
 class SweepConfig:
     problem: str = "ellipse"   # "ellipse" | "nozzle"
+    n_samples: int = 1         # number of simulation runs
 
-    # Log-normal sampling params — used only when mu_b_values is None.
-    mu_b_gen_count: int | None = None
-    mu_b_gen_mean: float | None = None
-    mu_b_gen_stdev: float | None = None
-
-    # Explicit list of mu_b values. Set to null in JSON to use random sampling.
-    mu_b_values: list[float] | None = None
+    # Maps parameter name → sampling spec.
+    param_specs: dict[str, dict] = field(default_factory=dict)
 
     save_t: float = 0.1
     n_iter: int | None = 5000
     end_t: float | None = None
 
-    # e.g. {"viscosity": 2e-3, "gamma": 1.4}
+    # Fixed overrides applied to every run after per-run sampling.
     phys_overrides: dict[str, Any] = field(default_factory=dict)
 
     output_subdir: str = "fvm_gen_datasets"
-
     reuse_mesh: bool = True
 
-    def __post_init__(self):
-        if self.mu_b_values is None:
-            missing = [
-                name for name, val in [
-                    ("mu_b_gen_count",  self.mu_b_gen_count),
-                    ("mu_b_gen_mean",   self.mu_b_gen_mean),
-                    ("mu_b_gen_stdev",  self.mu_b_gen_stdev),
-                ]
-                if val is None
-            ]
-            if missing:
-                raise ValueError(
-                    f"mu_b_values is None but required gen params are missing: {missing}"
-                )
-            assert self.mu_b_gen_mean is not None
-            assert self.mu_b_gen_stdev is not None
-            assert self.mu_b_gen_count is not None
-            log_samples = np.random.normal(
-                self.mu_b_gen_mean, self.mu_b_gen_stdev, size=self.mu_b_gen_count
-            )
-            self.mu_b_values = np.exp(log_samples).tolist()
+    # Populated by __post_init__: one dict per run with sampled values.
+    param_samples: list[dict[str, float]] | None = None
 
+    def __post_init__(self):
+        rng = np.random.default_rng()
+        per_param = {
+            name: _sample_param(name, spec, self.n_samples, rng)
+            for name, spec in self.param_specs.items()
+        }
+        self.param_samples = [
+            {name: vals[i] for name, vals in per_param.items()}
+            for i in range(self.n_samples)
+        ]

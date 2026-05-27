@@ -1,11 +1,15 @@
 {
     "problem": "ellipse",
+    "n_samples": 100,
     "n_iter": 10000,
     "save_t": 0.01,
-    "mu_b_gen_mean": -2.0,
-    "mu_b_gen_stdev": 1.0,
-    "mu_b_gen_count": 100,
-    "mu_b_values": [0.001],
+    "param_specs": {
+        "visc_bulk":    {"dist": "lognormal", "mean": -2.0, "std": 1.0},
+        "viscosity":    {"dist": "lognormal", "mean": -3.0, "std": 0.5},
+        "thermal_cond": {"dist": "lognormal", "mean": -6.0, "std": 0.5},
+        "C_v":          {"dist": "uniform",   "low":  1.5,  "high": 3.0},
+        "rho_inf":      {"dist": "uniform",   "low":  0.5,  "high": 2.0}
+    },
     "phys_overrides": {},
     "output_subdir": "fvm_gen_datasets",
     "reuse_mesh": true

@@ -1,8 +1,9 @@
 """
 Entry point for fvm_gen.
 
-Runs time_fvm for each mu_b value (and any other phys_overrides) defined in
-SweepConfig, saving each run into its own subdirectory.
+Runs time_fvm for each sampled parameter combination defined in SweepConfig,
+saving each run into its own numbered subdirectory alongside a params.json
+recording the exact values used.
 
 Usage
 -----
@@ -24,9 +25,6 @@ from cprint import c_print
 
 # ---------------------------------------------------------------------------
 # Make fvm_solver importable regardless of where the script is invoked from.
-#
-# The modules inside time_fvm/ use bare imports (e.g. `from sparse_utils import
-# ...`) so both fvm_solver/ and fvm_solver/time_fvm/ must be on sys.path.
 # ---------------------------------------------------------------------------
 _SOLVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "fvm_solver"))
 _TIME_FVM_DIR = os.path.join(_SOLVER_DIR, "time_fvm")
@@ -53,22 +51,31 @@ def _make_cfg(problem: str) -> ConfigFVM:
         raise ValueError(f"Unknown problem '{problem}'. Choose 'ellipse' or 'nozzle'.")
 
 
-def apply_overrides(cfg: ConfigFVM, overrides: dict[str, Any]) -> ConfigFVM:
-    """
-    Return a *copy* of cfg with the given field overrides applied.
+# Parameters that live on BC sub-configs rather than directly on ConfigFVM.
+_BC_PARAMS = {"rho_inf", "T_inf", "v_n_inf", "v_t_inf"}
 
-    Any field on ConfigFVM (or its subclass) can be overridden.
-    Raises AttributeError if a key does not correspond to a known field.
+
+def apply_overrides(cfg: ConfigFVM, overrides: dict[str, Any]) -> ConfigFVM:
+    """Return a deep copy of cfg with the given field overrides applied.
+
+    Direct ConfigFVM fields are set normally. The following BC parameters
+    are propagated to both inlet_cfg and exit_cfg when present:
+        rho_inf, T_inf, v_n_inf, v_t_inf
     """
     cfg = deepcopy(cfg)
     for key, value in overrides.items():
-        if not hasattr(cfg, key):
-            raise AttributeError(
-                f"ConfigFVM has no field '{key}'. "
-                f"Valid physical fields: visc_bulk, viscosity, thermal_cond, "
-                f"T_0, S_const, gamma, C_v, v_factor, lim_p, lim_K"
-            )
-        setattr(cfg, key, value)
+        if key in _BC_PARAMS:
+            for bc_cfg in (cfg.inlet_cfg, cfg.exit_cfg):
+                if bc_cfg is not None and hasattr(bc_cfg, key):
+                    setattr(bc_cfg, key, value)
+        else:
+            if not hasattr(cfg, key):
+                raise AttributeError(
+                    f"ConfigFVM has no field '{key}'. "
+                    f"Valid physical fields: visc_bulk, viscosity, thermal_cond, "
+                    f"C_v, gamma, T_0, v_factor, lim_p, lim_K, rho_inf"
+                )
+            setattr(cfg, key, value)
     return cfg
 
 
@@ -97,8 +104,6 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
 
     base_cfg = _make_cfg(sweep_cfg.problem)
 
-    # Allow the compute device to be overridden via environment variable.
-    # e.g.  FVM_DEVICE=cuda python run_sweep.py sweep.json
     device = os.environ.get("FVM_DEVICE")
     if device is not None:
         base_cfg = apply_overrides(base_cfg, {"device": device})
@@ -106,7 +111,6 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
     else:
         c_print(f"Device (FVM_DEVICE not set): {base_cfg.device}", "cyan")
 
-    # Output root
     out_root = os.path.join(_DEFAULT_DATA_DIR, sweep_cfg.output_subdir)
     os.makedirs(out_root, exist_ok=True)
     c_print(f"Output root: {out_root}", "cyan")
@@ -131,24 +135,33 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
     edge_tag = mesh_dict["edge_tag"]
     bound_edgs = mesh_dict["bound_edgs"]
 
-    # ---- sweep over mu_b values ----
-    assert sweep_cfg.mu_b_values is not None, "mu_b_values must be set by __post_init__"
-    n_runs = len(sweep_cfg.mu_b_values)
-    c_print(f"\nStarting sweep: {n_runs} mu_b value(s)\n", "cyan")
+    # ---- sweep over sampled parameter combinations ----
+    param_samples = sweep_cfg.param_samples
+    n_runs = len(param_samples)
+    c_print(f"\nStarting sweep: {n_runs} run(s), params: {list(sweep_cfg.param_specs)}\n", "cyan")
 
-    for run_idx, mu_b in enumerate(sweep_cfg.mu_b_values):
-        c_print(f"[{run_idx + 1}/{n_runs}]  mu_b = {mu_b:.4e}", "yellow")
+    for run_idx, run_params in enumerate(param_samples):
+        param_str = ", ".join(f"{k}={v:.3g}" for k, v in run_params.items())
+        c_print(f"[{run_idx + 1}/{n_runs}]  {param_str}", "yellow")
 
-        # Per-run save directory
-        run_name = f"mu_b_{mu_b:.4e}".replace("+", "").replace("-0", "-")
-        run_save_dir = os.path.join(out_root, run_name)
+        run_save_dir = os.path.join(out_root, f"run_{run_idx:04d}")
         os.makedirs(run_save_dir, exist_ok=True)
 
-        # Build per-run overrides: mu_b first, then any extra user overrides
-        # (extra overrides can themselves override mu_b if desired)
-        overrides = {"visc_bulk": mu_b, "plot": False, "exact_interval": True, "save_t": sweep_cfg.save_t,
-                     "n_iter": sweep_cfg.n_iter, "end_t": sweep_cfg.end_t,
-                     "save_dir": run_save_dir, **sweep_cfg.phys_overrides}
+        # Save the exact parameter values for this run.
+        with open(os.path.join(run_save_dir, "params.json"), "w") as f:
+            json.dump(run_params, f, indent=2)
+
+        # Per-run overrides: sampled params, then fixed overrides, then housekeeping.
+        overrides = {
+            **run_params,
+            **sweep_cfg.phys_overrides,
+            "plot": False,
+            "exact_interval": True,
+            "save_t": sweep_cfg.save_t,
+            "n_iter": sweep_cfg.n_iter,
+            "end_t": sweep_cfg.end_t,
+            "save_dir": run_save_dir,
+        }
         cfg = apply_overrides(base_cfg, overrides)
 
         phy_setup = FluidConstitution2D(cfg, dim=2)
