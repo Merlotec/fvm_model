@@ -118,10 +118,16 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
     # ---- optionally generate mesh once and reuse it ----
     mesh_cache_path = os.path.join(out_root, "shared_mesh.pkl")
 
+    mesh_dict = None
     if sweep_cfg.reuse_mesh and os.path.exists(mesh_cache_path):
         c_print("Loading cached shared mesh...", "green")
-        mesh_dict = pickle.load(open(mesh_cache_path, "rb"))
-    else:
+        try:
+            mesh_dict = pickle.load(open(mesh_cache_path, "rb"))
+        except Exception as e:
+            c_print(f"Cache load failed ({e}), regenerating mesh...", "yellow")
+            mesh_dict = None
+
+    if mesh_dict is None:
         c_print("Generating mesh...", "green")
         prob_def = generate_mesh(base_cfg)
         Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = prob_def
