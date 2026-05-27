@@ -36,8 +36,8 @@ for _p in (_SOLVER_DIR, _TIME_FVM_DIR):
 
 _DEFAULT_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
 
-from time_fvm.fvm_equation import FVMEquation, PhysicalSetup
-from time_fvm.fvm_mesh import FVMMesh
+from time_fvm.fvm_equation import FVMEquation, FluidConstitution2D
+from time_fvm.mesh_utils.fvm_mesh import FVMMesh2D
 from time_fvm.config_fvm import ConfigFVM, ConfigEllipse, ConfigNozzle
 from run_fvm import generate_mesh, init_conds_ellipses, init_conds_nozzle
 
@@ -121,13 +121,13 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
         c_print("Generating mesh...", "green")
         prob_def = generate_mesh(base_cfg)
         Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = prob_def
-        mesh = FVMMesh(Xs, tri_idx, all_edgs, bc_edge_mask, device=base_cfg.device)
+        mesh = FVMMesh2D(Xs, tri_idx, all_edgs, bc_edge_mask, device=base_cfg.device)
         mesh_dict = {"mesh": mesh, "edge_tag": edge_tag, "bound_edgs": bound_edgs}
         if sweep_cfg.reuse_mesh:
             pickle.dump(mesh_dict, open(mesh_cache_path, "wb"))
             c_print(f"Mesh saved to {mesh_cache_path}", "green")
 
-    mesh: FVMMesh = mesh_dict["mesh"]
+    mesh: FVMMesh2D = mesh_dict["mesh"]
     edge_tag = mesh_dict["edge_tag"]
     bound_edgs = mesh_dict["bound_edgs"]
 
@@ -151,7 +151,7 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
                      "save_dir": run_save_dir, **sweep_cfg.phys_overrides}
         cfg = apply_overrides(base_cfg, overrides)
 
-        phy_setup = PhysicalSetup(cfg)
+        phy_setup = FluidConstitution2D(cfg, dim=2)
         bc_tags, us_init = _init_conds(cfg, mesh, edge_tag, bound_edgs, phy_setup)
 
         solver = FVMEquation(cfg, phy_setup, mesh, cfg.N_comp, bc_tags, us_init=us_init)
