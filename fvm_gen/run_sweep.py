@@ -16,6 +16,8 @@ import json
 import os
 import sys
 import pickle
+import secrets
+from datetime import datetime
 from copy import deepcopy
 from typing import Any
 
@@ -111,7 +113,8 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
     else:
         c_print(f"Device (FVM_DEVICE not set): {base_cfg.device}", "cyan")
 
-    out_root = os.path.join(_DEFAULT_DATA_DIR, sweep_cfg.output_subdir)
+    sweep_uid = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3)
+    out_root = os.path.join(_DEFAULT_DATA_DIR, sweep_cfg.output_subdir, sweep_uid)
     os.makedirs(out_root, exist_ok=True)
     c_print(f"Output root: {out_root}", "cyan")
 
