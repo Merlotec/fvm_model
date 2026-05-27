@@ -17,7 +17,6 @@ import os
 import sys
 import pickle
 import secrets
-from datetime import datetime
 from copy import deepcopy
 from typing import Any
 
@@ -113,8 +112,8 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
     else:
         c_print(f"Device (FVM_DEVICE not set): {base_cfg.device}", "cyan")
 
-    sweep_uid = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3)
-    out_root = os.path.join(_DEFAULT_DATA_DIR, sweep_cfg.output_subdir, sweep_uid)
+    sweep_uid = secrets.token_hex(4)
+    out_root = os.path.join(_DEFAULT_DATA_DIR, sweep_cfg.output_subdir)
     os.makedirs(out_root, exist_ok=True)
     c_print(f"Output root: {out_root}", "cyan")
 
@@ -153,7 +152,7 @@ def run_sweep(sweep_cfg: SweepConfig | None = None):
         param_str = ", ".join(f"{k}={v:.3g}" for k, v in run_params.items())
         c_print(f"[{run_idx + 1}/{n_runs}]  {param_str}", "yellow")
 
-        run_save_dir = os.path.join(out_root, f"run_{run_idx:04d}")
+        run_save_dir = os.path.join(out_root, f"run_{run_idx:04d}_{sweep_uid}")
         os.makedirs(run_save_dir, exist_ok=True)
 
         # Save the exact parameter values for this run.
