@@ -38,6 +38,7 @@ Navigation
 
 import os
 import sys
+import pickle
 import argparse
 from pathlib import Path
 
@@ -143,14 +144,22 @@ def _encode_apng(frames: list[np.ndarray], fps: int = 8) -> bytes:
 # Data helpers — real data
 # ---------------------------------------------------------------------------
 
+def _has_frames(d: str) -> bool:
+    return any(f.startswith("t_") and f.endswith(".npz") for f in os.listdir(d))
+
+
 def find_run_dirs(root_dir: str) -> list[str]:
-    if os.path.exists(os.path.join(root_dir, "mesh_props.npz")):
+    # Single run dir (old format: mesh_props.npz present; new format: t_*.npz present)
+    if os.path.exists(os.path.join(root_dir, "mesh_props.npz")) or _has_frames(root_dir):
         return [root_dir]
     runs = sorted(
         os.path.join(root_dir, name)
         for name in os.listdir(root_dir)
         if os.path.isdir(os.path.join(root_dir, name))
-        and os.path.exists(os.path.join(root_dir, name, "mesh_props.npz"))
+        and (
+            os.path.exists(os.path.join(root_dir, name, "mesh_props.npz"))
+            or _has_frames(os.path.join(root_dir, name))
+        )
     )
     if not runs:
         raise RuntimeError(f"No run directories found under {root_dir}")
@@ -159,9 +168,6 @@ def find_run_dirs(root_dir: str) -> list[str]:
 
 def find_gen_run_dirs(root_dir: str) -> list[str]:
     """Find generated-data run dirs (no mesh_props.npz required; just t_*.npz files)."""
-    def _has_frames(d: str) -> bool:
-        return any(f.startswith("t_") and f.endswith(".npz") for f in os.listdir(d))
-
     if _has_frames(root_dir):
         return [root_dir]
     return sorted(
@@ -179,16 +185,38 @@ def load_mesh(run_dir: str) -> dict:
 
 def build_renderer(run_dir: str, resolution: tuple[int, int]) -> MeshRenderer:
     H, W = resolution
-    cache_path = os.path.join(run_dir, f"renderer_cache_{H}x{W}.pt")
-    if os.path.exists(cache_path):
-        return MeshRenderer.from_cache(cache_path, device="cpu")
-    mesh = load_mesh(run_dir)
-    renderer = MeshRenderer(
-        vertices   = mesh["vertices"],
-        triangles  = mesh["triangles"],
-        resolution = resolution,
-        device     = "cpu",
-    )
+    mesh_npz   = os.path.join(run_dir, "mesh_props.npz")
+    parent_dir = os.path.dirname(run_dir)
+    shared_pkl = os.path.join(parent_dir, "shared_mesh.pkl")
+
+    if os.path.exists(mesh_npz):
+        # Old format: per-run mesh stored alongside the data
+        cache_path = os.path.join(run_dir, f"renderer_cache_{H}x{W}.pt")
+        if os.path.exists(cache_path):
+            return MeshRenderer.from_cache(cache_path, device="cpu")
+        mesh = load_mesh(run_dir)
+        renderer = MeshRenderer(
+            vertices=mesh["vertices"], triangles=mesh["triangles"],
+            resolution=resolution, device="cpu",
+        )
+    elif os.path.exists(shared_pkl):
+        # New format: shared mesh at dataset level, cache stored there too
+        cache_path = os.path.join(parent_dir, f"renderer_cache_{H}x{W}.pt")
+        if os.path.exists(cache_path):
+            return MeshRenderer.from_cache(cache_path, device="cpu")
+        with open(shared_pkl, "rb") as f:
+            mesh_dict = pickle.load(f)
+        fvm_mesh = mesh_dict["mesh"]
+        renderer = MeshRenderer(
+            vertices=fvm_mesh.vertices.cpu().numpy(),
+            triangles=fvm_mesh.cells.cpu().numpy(),
+            resolution=resolution, device="cpu",
+        )
+    else:
+        raise FileNotFoundError(
+            f"No mesh found for {run_dir}: checked {mesh_npz} and {shared_pkl}"
+        )
+
     renderer.save_cache(cache_path)
     return renderer
 
