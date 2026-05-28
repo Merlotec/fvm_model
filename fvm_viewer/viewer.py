@@ -202,13 +202,24 @@ def build_renderer(run_dir: str, resolution: tuple[int, int]) -> MeshRenderer:
     elif os.path.exists(shared_pkl):
         # New format: shared mesh at dataset level, cache stored there too
         cache_path = os.path.join(parent_dir, f"renderer_cache_{H}x{W}.pt")
-        if os.path.exists(cache_path):
-            return MeshRenderer.from_cache(cache_path, device="cpu")
         with open(shared_pkl, "rb") as f:
             mesh_dict = pickle.load(f)
         fvm_mesh = mesh_dict["mesh"]
+        verts = fvm_mesh.vertices.cpu().numpy()
+        n_cells = int(fvm_mesh.cells.shape[0])
+        x0, x1 = float(verts[:, 0].min()), float(verts[:, 0].max())
+        y0, y1 = float(verts[:, 1].min()), float(verts[:, 1].max())
+        if os.path.exists(cache_path):
+            _r = MeshRenderer.from_cache(cache_path, device="cpu")
+            eps = 1e-3
+            if (_r._c2v_tri.max().item() + 1 == n_cells
+                    and abs(_r.xlim[0] - x0) < eps and abs(_r.xlim[1] - x1) < eps
+                    and abs(_r.ylim[0] - y0) < eps and abs(_r.ylim[1] - y1) < eps):
+                return _r
+            print(f"  Viewer renderer cache stale, rebuilding...")
+            os.unlink(cache_path)
         renderer = MeshRenderer(
-            vertices=fvm_mesh.vertices.cpu().numpy(),
+            vertices=verts,
             triangles=fvm_mesh.cells.cpu().numpy(),
             resolution=resolution, device="cpu",
         )
