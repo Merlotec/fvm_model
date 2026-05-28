@@ -36,6 +36,7 @@ Navigation
     Plotly figures support scroll-to-zoom and drag-to-pan.
 """
 
+import json
 import os
 import sys
 import pickle
@@ -311,6 +312,31 @@ def make_delta_figure(delta: np.ndarray, title: str, maxabs: float | None = None
     return fig
 
 
+def load_params(run_dir: str) -> dict:
+    path = os.path.join(run_dir, "params.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _params_children(params: dict) -> list:
+    if not params:
+        return []
+    rows = [
+        html.Div(
+            f"{k}:  {v:.4g}" if isinstance(v, float) else f"{k}:  {v}",
+            style={"fontSize": "10px", "padding": "1px 0", "whiteSpace": "nowrap"},
+        )
+        for k, v in params.items()
+    ]
+    return [
+        html.Hr(style={"margin": "8px 0", "borderColor": "#ddd"}),
+        html.Div("Parameters", style={"fontSize": "11px", "fontWeight": "600", "marginBottom": "3px"}),
+        *rows,
+    ]
+
+
 def _sidebar(run_options: list[dict]) -> html.Div:
     return html.Div([
         html.H4("Runs", style={"margin": "0 0 10px 0", "fontSize": "13px", "fontWeight": "600"}),
@@ -319,6 +345,7 @@ def _sidebar(run_options: list[dict]) -> html.Div:
             labelStyle={"display": "block", "fontSize": "11px",
                         "padding": "3px 0", "cursor": "pointer", "wordBreak": "break-all"},
         ),
+        html.Div(id="params-display"),
     ], style={"width": "190px", "flexShrink": "0", "padding": "12px 10px",
               "borderRight": "1px solid #ddd", "overflowY": "auto", "fontFamily": "monospace"})
 
@@ -378,6 +405,7 @@ def build_app(root_dir: str) -> dash.Dash:
     print("Precomputing renderers...")
     renderers: dict[str, MeshRenderer] = {d: build_renderer(d, RESOLUTION) for d in run_dirs}
     all_files: dict[str, list[str]]    = {d: find_timestep_files(d) for d in run_dirs}
+    all_params: list[dict]             = [load_params(d) for d in run_dirs]
     print("Ready.")
 
     app  = dash.Dash(__name__, title="FVM Viewer")
@@ -524,6 +552,13 @@ def build_app(root_dir: str) -> dash.Dash:
         print(f'APNG ready ({len(video_bytes) // 1024} KB)')
         return dcc.send_bytes(video_bytes, filename=f'{name}.png'), ''
 
+    @app.callback(
+        Output("params-display", "children"),
+        Input("run-selector", "value"),
+    )
+    def show_params(run_idx):
+        return _params_children(all_params[run_idx or 0])
+
     return app
 
 
@@ -576,6 +611,7 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     print("Precomputing renderers for real data...")
     renderers:      dict[str, MeshRenderer] = {d: build_renderer(d, render_res) for d in real_run_dirs}
     real_files_map: dict[str, list[str]]    = {d: find_timestep_files(d) for d in real_run_dirs}
+    all_params:     list[dict]              = [load_params(d) for d in real_run_dirs]
     print("Ready.")
 
     app  = dash.Dash(__name__, title="FVM Viewer — Compare")
@@ -759,6 +795,13 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         video_bytes = _encode_apng(frames)
         print(f'APNG ready ({len(video_bytes) // 1024} KB)')
         return dcc.send_bytes(video_bytes, filename=f'{name}_comparison.png'), ''
+
+    @app.callback(
+        Output("params-display", "children"),
+        Input("run-selector", "value"),
+    )
+    def show_params(run_idx):
+        return _params_children(all_params[run_idx or 0])
 
     return app
 
