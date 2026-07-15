@@ -1,0 +1,33 @@
+{
+  "problem": ["ellipse", "nozzle"],
+  "n_meshes": 12,
+  "runs_per_mesh": 16,
+  "seed": 42,
+
+  "save_t": 0.01,
+  "n_iter": 12000,
+  "print_i": 500,
+  "compile": true,
+
+  "output_subdir": "fvm_gen_v2",
+
+  "param_specs": {
+    "visc_model":       {"choices": ["Newtonian", "PowerLaw", "Carreau", "HerschelBulkley"]},
+    "visc_n":           {"dist": "uniform",   "low": 0.3,  "high": 1.8},
+    "visc_min_factor":  {"dist": "uniform",   "low": 0.1,  "high": 0.6},
+    "visc_gamma_scale": {"dist": "loguniform","low": 2.0,  "high": 40.0},
+
+    "viscosity":        {"dist": "loguniform","low": 3e-4, "high": 6e-2},
+    "visc_bulk":        {"dist": "loguniform","low": 1e-3, "high": 3e-1},
+    "thermal_cond":     {"dist": "loguniform","low": 5e-7, "high": 5e-3},
+    "C_v":              {"dist": "uniform",   "low": 1.5,  "high": 3.0},
+    "gamma":            {"dist": "uniform",   "low": 1.1,  "high": 1.67},
+
+    "rho_inf":          {"dist": "uniform",   "low": 0.5,  "high": 2.0},
+    "T_inf":            {"dist": "uniform",   "low": 80.0, "high": 140.0},
+    "v_n_inf":          {"dist": "uniform",   "low": 2.0,  "high": 7.0},
+    "v_t_inf":          {"dist": "uniform",   "low": -4.0, "high": 4.0}
+  },
+
+  "phys_overrides": {}
+}

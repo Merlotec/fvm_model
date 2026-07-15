@@ -95,22 +95,27 @@ def _render_frame_rgb(
 
     CELL_W, CELL_H = 256, 256
     BAR_H   = 22
+    LABEL_H = 20   # white strip with numbers above the gradient
+    SCALE_H = 20   # gradient strip at the very bottom
     TITLE_H = 28 if title else 0
+    n_rows  = len(rows)
+    has_scale = bool(zranges)
     total_w = 4 * CELL_W
-    total_h = TITLE_H + len(rows) * (BAR_H + CELL_H)
+    total_h = TITLE_H + n_rows * (BAR_H + CELL_H) + (LABEL_H + SCALE_H if has_scale else 0)
 
-    canvas = Image.new('RGB', (total_w, total_h), (24, 24, 24))
+    canvas = Image.new('RGB', (total_w, total_h), (255, 255, 255))
     draw   = ImageDraw.Draw(canvas)
 
     if title:
-        draw.text((total_w // 2, TITLE_H // 2), title, fill=(210, 210, 210), anchor='mm')
+        draw.text((total_w // 2, TITLE_H // 2), title, fill=(20, 20, 20), anchor='mm')
 
+    y = TITLE_H
     for ri, (label, grid) in enumerate(rows):
         prev  = prev_rows[ri] if prev_rows else None
-        y_bar = TITLE_H + ri * (BAR_H + CELL_H)
-        y_img = y_bar + BAR_H
-        draw.rectangle([0, y_bar, total_w, y_bar + BAR_H - 1], fill=(45, 45, 45))
-        draw.text((6, y_bar + BAR_H // 2), label, fill=(180, 180, 220), anchor='lm')
+        y_bar = y
+        y_img = y + BAR_H
+        draw.rectangle([0, y_bar, total_w, y_bar + BAR_H - 1], fill=(235, 235, 235))
+        draw.text((6, y_bar + BAR_H // 2), label, fill=(20, 20, 20), anchor='lm')
 
         for ci in range(4):
             x0 = ci * CELL_W
@@ -122,7 +127,30 @@ def _render_frame_rgb(
                 zmin, zmax = zranges[ci] if zranges else (float(grid[ci].min()), float(grid[ci].max()))
                 thumb  = _apply_cmap(grid[ci], 'viridis', zmin, zmax, CELL_W, CELL_H)
             canvas.paste(Image.fromarray(thumb), (x0, y_img))
-            draw.text((x0 + 4, y_img + 4), FIELD_NAMES[ci], fill=(255, 255, 255))
+            draw.text((x0 + 4, y_img + 4), FIELD_NAMES[ci], fill=(240, 240, 240))
+
+        y += BAR_H + CELL_H
+
+    if has_scale:
+        # White label strip: channel name + min/max numbers
+        y_label = y
+        draw.rectangle([0, y_label, total_w, y_label + LABEL_H - 1], fill=(255, 255, 255))
+        for ci in range(4):
+            x0 = ci * CELL_W
+            zmin, zmax = zranges[ci]
+            mid = x0 + CELL_W // 2
+            draw.text((x0 + 4, y_label + LABEL_H // 2), f"{zmin:.2g}", fill=(20, 20, 20), anchor='lm')
+            draw.text((mid,    y_label + LABEL_H // 2), FIELD_NAMES[ci], fill=(20, 20, 20), anchor='mm')
+            draw.text((x0 + CELL_W - 4, y_label + LABEL_H // 2), f"{zmax:.2g}", fill=(20, 20, 20), anchor='rm')
+        # Gradient strip below the labels
+        y_scale = y_label + LABEL_H
+        cmap = 'RdBu_r' if view_mode == 'delta' else 'viridis'
+        for ci in range(4):
+            x0 = ci * CELL_W
+            zmin, zmax = zranges[ci]
+            grad_data = np.tile(np.linspace(zmin, zmax, CELL_W).astype(np.float32), (SCALE_H, 1))
+            grad_rgb  = _apply_cmap(grad_data, cmap, zmin, zmax, CELL_W, SCALE_H)
+            canvas.paste(Image.fromarray(grad_rgb), (x0, y_scale))
 
     return np.array(canvas)
 
@@ -255,6 +283,15 @@ def load_gen_frame(path: str) -> tuple[float, np.ndarray, bool]:
     return float(d["t"]), d["grid"].astype(np.float32), bool(d["is_seed"])
 
 
+def load_gen_shards(path: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """Optional latent shard cloud for a generated frame: (xy [M,2] pixel coords,
+    act [M] active(1)->shadow(0) gate), or None if the frame has no shard data."""
+    d = np.load(path)
+    if "shard_xy" not in d.files:
+        return None
+    return d["shard_xy"].astype(np.float32), d["shard_act"].astype(np.float32)
+
+
 def closest_idx(files: list[str], target_t: float) -> int:
     return min(range(len(files)), key=lambda i: abs(t_of_file(files[i]) - target_t))
 
@@ -296,6 +333,31 @@ def make_field_figure(grid: np.ndarray, title: str,
     return fig
 
 
+def make_shard_figure(shards: tuple[np.ndarray, np.ndarray] | None,
+                      H: int, W: int, title: str) -> go.Figure:
+    """Latent shard point cloud on the SAME pixel axes as the field heatmaps.
+    Colour runs blue (active, gate=1) -> red (shadow, gate=0)."""
+    fig = go.Figure()
+    if shards is not None and len(shards[0]):
+        xy, act = shards
+        fig.add_trace(go.Scattergl(
+            x=xy[:, 0], y=xy[:, 1], mode="markers",
+            marker=dict(size=6, color=act, colorscale=[[0.0, "red"], [1.0, "blue"]],
+                        cmin=0.0, cmax=1.0, showscale=True, line=dict(width=0),
+                        colorbar=dict(thickness=10, len=0.85, title="active")),
+            hovertemplate="x=%{x:.1f} y=%{y:.1f}<br>active=%{marker.color:.2f}<extra></extra>",
+        ))
+    # share the heatmap's frame: x in [0,W], y reversed in [0,H], square aspect
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=12), x=0.5, xanchor="center"),
+        xaxis=dict(visible=False, range=[0, W], scaleanchor="y", constrain="domain"),
+        yaxis=dict(visible=False, range=[H, 0]),
+        margin=dict(l=0, r=0, t=36, b=0), height=280,
+        plot_bgcolor="#f7f7f7", uirevision="shards",
+    )
+    return fig
+
+
 def make_delta_figure(delta: np.ndarray, title: str, maxabs: float | None = None) -> go.Figure:
     if maxabs is None:
         maxabs = float(np.abs(delta).max()) or 1.0
@@ -308,6 +370,24 @@ def make_delta_figure(delta: np.ndarray, title: str, maxabs: float | None = None
         title=dict(text=title, font=dict(size=12), x=0.5, xanchor="center"),
         uirevision=title,
         **_HEATMAP_LAYOUT,
+    )
+    return fig
+
+
+def make_colorscale_figure(zmin: float, zmax: float, label: str,
+                           colorscale: str = "Viridis") -> go.Figure:
+    """Thin horizontal colorscale bar as a 1-row heatmap, placed between real and gen rows."""
+    n = 200
+    z = np.linspace(zmin, zmax, n).reshape(1, n)
+    fig = go.Figure(go.Heatmap(z=z, colorscale=colorscale, showscale=False, zmin=zmin, zmax=zmax))
+    fig.update_layout(
+        title=dict(text=f"{label}  [{zmin:.3g} → {zmax:.3g}]", font=dict(size=9), x=0.5, xanchor="center"),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        margin=dict(l=4, r=4, t=18, b=4),
+        height=44,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     return fig
 
@@ -335,6 +415,13 @@ def _params_children(params: dict) -> list:
         html.Div("Parameters", style={"fontSize": "11px", "fontWeight": "600", "marginBottom": "3px"}),
         *rows,
     ]
+
+
+def _params_header_str(params: dict) -> str:
+    if not params:
+        return ""
+    parts = [f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in params.items()]
+    return "   ".join(parts)
 
 
 def _sidebar(run_options: list[dict]) -> html.Div:
@@ -614,6 +701,18 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     all_params:     list[dict]              = [load_params(d) for d in real_run_dirs]
     print("Ready.")
 
+    # Precompute number of seed frames per gen run (seeds are always at the front)
+    n_seed_map: dict[str, int] = {}
+    for _gd in gen_run_dirs:
+        _n = 0
+        for _f in gen_files_map[_gd]:
+            _, _, _is_seed = load_gen_frame(_f)
+            if _is_seed:
+                _n += 1
+            else:
+                break
+        n_seed_map[_gd] = max(_n, 1)
+
     app  = dash.Dash(__name__, title="FVM Viewer — Compare")
     opts = [{"label": name, "value": i} for i, name in enumerate(run_names)]
 
@@ -623,6 +722,11 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
             *[dcc.Graph(id=f"plot-top-{i}", config=_GRAPH_CFG) for i in range(4)],
             html.Div(id="row-label-bot", children="Generated", style=_ROW_LABEL_STYLE),
             *[dcc.Graph(id=f"plot-bot-{i}", config=_GRAPH_CFG) for i in range(4)],
+            *[dcc.Graph(id=f"plot-scale-{i}", config=_GRAPH_CFG,
+                        style={"height": "52px"}) for i in range(4)],
+            html.Div(id="row-label-shards",
+                     children="Shards (blue = active, red = shadow)", style=_ROW_LABEL_STYLE),
+            dcc.Graph(id="plot-shards", config=_GRAPH_CFG, style={"gridColumn": "span 2"}),
         ],
         style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr",
                "gap": "4px", "padding": "4px"},
@@ -685,8 +789,11 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     @app.callback(
         Output("plot-top-0", "figure"), Output("plot-top-1", "figure"),
         Output("plot-top-2", "figure"), Output("plot-top-3", "figure"),
+        Output("plot-scale-0", "figure"), Output("plot-scale-1", "figure"),
+        Output("plot-scale-2", "figure"), Output("plot-scale-3", "figure"),
         Output("plot-bot-0", "figure"), Output("plot-bot-1", "figure"),
         Output("plot-bot-2", "figure"), Output("plot-bot-3", "figure"),
+        Output("plot-shards", "figure"),
         Output("row-label-top", "children"),
         Output("row-label-bot", "children"),
         Output("header-info", "children"),
@@ -701,16 +808,25 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         gen_dir  = gen_run_dirs[run_idx]
         gen_files  = gen_files_map[gen_dir]
         real_files = real_files_map[real_dir]
+        params = all_params[run_idx]
 
         gen_t, gen_grid, is_seed = load_gen_frame(gen_files[step_idx])
+        gen_H, gen_W = gen_grid.shape[1], gen_grid.shape[2]
+        shard_fig = make_shard_figure(load_gen_shards(gen_files[step_idx]),
+                                      gen_H, gen_W, "shards  " + ("seed" if is_seed else "pred"))
         real_idx  = closest_idx(real_files, gen_t)
         real_t, cell_prims = load_step(real_files[real_idx])
         real_grid = renderers[real_dir].render_cell_smooth(cell_prims).numpy()
 
+        n_seed    = n_seed_map[gen_dir]
+        relative_t = step_idx - (n_seed - 1)
         frame_tag = "seed" if is_seed else "pred"
-        n      = len(gen_files)
-        header = (f"{run_names[run_idx]}   |   step {step_idx + 1}/{n}   |   "
-                  f"t = {gen_t:.4g} ({frame_tag})   |   real t = {real_t:.4g}")
+        n         = len(gen_files)
+
+        params_str = _params_header_str(params)
+        header = f"{run_names[run_idx]}   |   t = {relative_t}  ({frame_tag})"
+        if params_str:
+            header += f"   |   {params_str}"
 
         if view_mode == "delta":
             if step_idx > 0:
@@ -727,19 +843,22 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
                 float(max(np.abs(real_delta[i]).max(), np.abs(gen_delta[i]).max())) or 1.0
                 for i in range(4)
             ]
-            top_figs  = [make_delta_figure(real_delta[i], f"Δ{FIELD_NAMES[i]}  real",       shared_maxabs[i]) for i in range(4)]
-            bot_figs  = [make_delta_figure(gen_delta[i],  f"Δ{FIELD_NAMES[i]}  {frame_tag}", shared_maxabs[i]) for i in range(4)]
+            top_figs   = [make_delta_figure(real_delta[i], f"Δ{FIELD_NAMES[i]}  real",       shared_maxabs[i]) for i in range(4)]
+            scale_figs = [make_colorscale_figure(-shared_maxabs[i], shared_maxabs[i], FIELD_NAMES[i], "RdBu") for i in range(4)]
+            bot_figs   = [make_delta_figure(gen_delta[i],  f"Δ{FIELD_NAMES[i]}  {frame_tag}", shared_maxabs[i]) for i in range(4)]
             top_label = "Real Δ (current − previous)"
             bot_label = "Generated Δ (current − previous)"
         else:
             shared_zmin = [float(min(real_grid[i].min(), gen_grid[i].min())) for i in range(4)]
             shared_zmax = [float(max(real_grid[i].max(), gen_grid[i].max())) for i in range(4)]
-            top_figs  = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real",       shared_zmin[i], shared_zmax[i]) for i in range(4)]
-            bot_figs  = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}", shared_zmin[i], shared_zmax[i]) for i in range(4)]
+            top_figs   = [make_field_figure(real_grid[i], f"{FIELD_NAMES[i]}  real",       shared_zmin[i], shared_zmax[i]) for i in range(4)]
+            scale_figs = [make_colorscale_figure(shared_zmin[i], shared_zmax[i], FIELD_NAMES[i]) for i in range(4)]
+            bot_figs   = [make_field_figure(gen_grid[i],  f"{FIELD_NAMES[i]}  {frame_tag}", shared_zmin[i], shared_zmax[i]) for i in range(4)]
             top_label = "Real"
             bot_label = "Generated"
 
-        return (*top_figs, *bot_figs, top_label, bot_label, header, n - 1, step_idx)
+        return (*top_figs, *scale_figs, *bot_figs, shard_fig,
+                top_label, bot_label, header, n - 1, step_idx)
 
     @app.callback(
         Output("video-download", "data"),

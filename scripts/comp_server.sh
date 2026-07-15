@@ -1,1 +1,1 @@
-python fvm_viewer/viewer.py data/fvm_gen_datasets -c out/test_infer --port 8050
+python fvm_viewer/viewer.py ../data/test -c ../hfm/out/viewer --port 8051
