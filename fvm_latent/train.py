@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 Training script for the Multi-Level Fluid Model.
 
@@ -101,7 +102,7 @@ def main() -> None:
     decoder_type = _HP.get('decoder_type', 'per_level')
     c_print(
         f'Model: {n_param:.1f}M params | {model.n_levels} levels × {P} patches = '
-        f'{model.n_levels * P} tokens max | decoder={decoder_type}',
+        f'{model.n_levels * P} tokens | decoder={decoder_type}',
         color='cyan',
     )
 

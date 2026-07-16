@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 Autoregressive inference using a trained DiffusionDecoder (stage-2 checkpoint).
 
@@ -91,7 +92,7 @@ def run_inference(
     checkpoint:      Path,
     out_dir:         Path,
     ddim_steps:      int       = 50,
-    n_steps:         int | None = None,
+    n_steps:         Optional[int] = None,
     data_dir:        Path       = DATASET_DIR,
     teacher_forcing: bool       = False,
 ) -> None:
@@ -150,7 +151,7 @@ def run_inference(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     mode = 'teacher-forcing' if teacher_forcing else 'autoregressive'
-    c_print(f'Seed: {WINDOW_SIZE} frames  |  Steps: {n_steps}  |  Mode: {mode}', color='cyan')
+    c_print(f'Seed: {WINDOW_SIZE} frames | Steps: {n_steps}  |  Mode: {mode}', color='cyan')
 
     seed_files = all_files[FIRST_FRAME : FIRST_FRAME + WINDOW_SIZE]
     window: list[torch.Tensor] = []
@@ -213,7 +214,7 @@ def run_inference_random(
     out_root:        Path,
     n_runs:          int,
     ddim_steps:      int        = 50,
-    n_steps:         int | None = None,
+    n_steps:         Optional[int] = None,
     seed:            int        = 0,
     teacher_forcing: bool       = False,
 ) -> None:

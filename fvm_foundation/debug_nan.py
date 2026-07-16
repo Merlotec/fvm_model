@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 NaN diagnostic for FluidVisionModel.
 
@@ -33,7 +34,7 @@ WINDOW_SIZE  = HP['window_size']
 NUM_PATCHES  = (H // PATCH_SIZE) * (W // PATCH_SIZE)
 
 
-def build_model(ckpt_path: Path | None) -> nn.Module:
+def build_model(ckpt_path: Optional[Path]) -> nn.Module:
     model = FluidVisionModel(
         num_obs      = WINDOW_SIZE,
         num_patches  = NUM_PATCHES,

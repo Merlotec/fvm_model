@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 Run autoregressive inference with a trained FluidVisionModel.
 
@@ -112,7 +113,7 @@ def run_inference(
     sim_dir:         Path,
     checkpoint:      Path,
     out_dir:         Path,
-    n_steps:         int | None = None,
+    n_steps:         Optional[int] = None,
     data_dir:        Path = DATASET_DIR,
     teacher_forcing: bool = False,
 ) -> None:
@@ -268,7 +269,7 @@ def run_inference_random(
     checkpoint:      Path,
     out_root:        Path,
     n_runs:          int,
-    n_steps:         int | None = None,
+    n_steps:         Optional[int] = None,
     seed:            int        = 0,
     teacher_forcing: bool       = False,
 ) -> None:

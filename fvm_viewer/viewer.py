@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 FVM solution browser-based viewer.
 
@@ -86,8 +87,8 @@ def _apply_cmap(data: np.ndarray, cmap_name: str,
 def _render_frame_rgb(
     rows: list[tuple[str, np.ndarray]],
     view_mode: str,
-    prev_rows: list[np.ndarray] | None = None,
-    zranges: list[tuple[float, float]] | None = None,
+    prev_rows: Optional[list[np.ndarray]] = None,
+    zranges: Optional[list[tuple[float, float]]] = None,
     title: str = '',
 ) -> np.ndarray:
     """Render one video frame as RGB [H, W, 3] using PIL — no matplotlib figure."""
@@ -283,7 +284,7 @@ def load_gen_frame(path: str) -> tuple[float, np.ndarray, bool]:
     return float(d["t"]), d["grid"].astype(np.float32), bool(d["is_seed"])
 
 
-def load_gen_shards(path: str) -> tuple[np.ndarray, np.ndarray] | None:
+def load_gen_shards(path: str) -> Optional[tuple[np.ndarray, np.ndarray]]:
     """Optional latent shard cloud for a generated frame: (xy [M,2] pixel coords,
     act [M] active(1)->shadow(0) gate), or None if the frame has no shard data."""
     d = np.load(path)
@@ -319,7 +320,7 @@ _TOGGLE_STYLE = {
 
 
 def make_field_figure(grid: np.ndarray, title: str,
-                      zmin: float | None = None, zmax: float | None = None) -> go.Figure:
+                      zmin: Optional[float] = None, zmax: Optional[float] = None) -> go.Figure:
     fig = go.Figure(go.Heatmap(
         z=grid, colorscale="Viridis", showscale=True,
         zmin=zmin, zmax=zmax,
@@ -333,7 +334,7 @@ def make_field_figure(grid: np.ndarray, title: str,
     return fig
 
 
-def make_shard_figure(shards: tuple[np.ndarray, np.ndarray] | None,
+def make_shard_figure(shards: Optional[tuple[np.ndarray, np.ndarray]],
                       H: int, W: int, title: str) -> go.Figure:
     """Latent shard point cloud on the SAME pixel axes as the field heatmaps.
     Colour runs blue (active, gate=1) -> red (shadow, gate=0)."""
@@ -358,7 +359,7 @@ def make_shard_figure(shards: tuple[np.ndarray, np.ndarray] | None,
     return fig
 
 
-def make_delta_figure(delta: np.ndarray, title: str, maxabs: float | None = None) -> go.Figure:
+def make_delta_figure(delta: np.ndarray, title: str, maxabs: Optional[float] = None) -> go.Figure:
     if maxabs is None:
         maxabs = float(np.abs(delta).max()) or 1.0
     fig = go.Figure(go.Heatmap(

@@ -99,7 +99,7 @@ def _sample_one(name: str, spec: dict, rng: np.random.Generator):
 
 @dataclass
 class GenConfig:
-    problem: "str | list" = "ellipse"  # "ellipse" | "nozzle" | a list to mix per mesh
+    problem: "Union[str, list]" = "ellipse"  # "ellipse" | "nozzle" | a list to mix per mesh
     n_meshes: int = 8                 # distinct collider geometries
     runs_per_mesh: int = 16           # parameter draws per geometry
     seed: int = 42
@@ -107,14 +107,14 @@ class GenConfig:
     # Solver run controls (applied to every run).
     save_t: float = 0.01              # sim-time between saved frames
     n_iter: int = 10000               # max solver iterations
-    end_t: float | None = None        # max sim time (optional; None => run n_iter steps)
+    end_t: Optional[float] = None        # max sim time (optional; None => run n_iter steps)
     print_i: int = 500
     compile: bool = True              # torch.compile the step (fast on GPU)
 
     # Mesh sizing (obstacle/cell scale); passed straight to the config.
-    min_A: float | None = None
-    max_A: float | None = None
-    lnscale: float | None = None
+    min_A: Optional[float] = None
+    max_A: Optional[float] = None
+    lnscale: Optional[float] = None
 
     # Per-run sampling.  Categorical specs use {"choices": [...]}, continuous use
     # {"dist": "lognormal"|"uniform"|"loguniform", ...} or {"values": [...]}.

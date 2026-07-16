@@ -15,7 +15,7 @@ Special parameter handled via BC configs:
   rho_inf  — applied to both inlet_cfg.rho_inf and exit_cfg.rho_inf
 """
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Union, Any, Optional
 
 import numpy as np
 
@@ -46,8 +46,8 @@ class SweepConfig:
     param_specs: dict[str, dict] = field(default_factory=dict)
 
     save_t: float = 0.1
-    n_iter: int | None = 5000
-    end_t: float | None = None
+    n_iter: Optional[int] = 5000
+    end_t: Optional[float] = None
 
     # Fixed overrides applied to every run after per-run sampling.
     phys_overrides: dict[str, Any] = field(default_factory=dict)
@@ -56,7 +56,7 @@ class SweepConfig:
     reuse_mesh: bool = True
 
     # Populated by __post_init__: one dict per run with sampled values.
-    param_samples: list[dict[str, float]] | None = None
+    param_samples: Optional[list[dict[str, float]]] = None
 
     def __post_init__(self):
         rng = np.random.default_rng()

@@ -1,3 +1,4 @@
+from typing import Optional, Union
 import json
 import os
 from pathlib import Path
@@ -66,7 +67,7 @@ class FVMDataModule(L.LightningDataModule):
         self.window_size = window_size
         self._renderer   = None
 
-    def setup(self, stage: str | None = None):
+    def setup(self, stage: Optional[str] = None):
         c_print('Building renderer...', color='yellow')
         self._renderer = build_renderer(self.data_dir, RESOLUTION, device='cpu')
 

@@ -18,7 +18,7 @@ import sys
 import pickle
 import secrets
 from copy import deepcopy
-from typing import Any
+from typing import Union, Any
 
 import numpy as np
 import torch
@@ -96,7 +96,7 @@ def sweep_cfg_from_file(path: str) -> SweepConfig:
     return SweepConfig(**data)
 
 
-def run_sweep(sweep_cfg: SweepConfig | None = None):
+def run_sweep(sweep_cfg: Optional[SweepConfig] = None):
     if sweep_cfg is None:
         sweep_cfg = SweepConfig()
 

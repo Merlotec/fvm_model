@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from pathlib import Path
 
 import numpy as np
@@ -28,9 +30,9 @@ class MeshRenderer:
         vertices: np.ndarray,
         triangles: np.ndarray,
         resolution: tuple[int, int] = (224, 224),
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-        device: torch.device | str = "cpu",
+        xlim: Optional[tuple[float, float]] = None,
+        ylim: Optional[tuple[float, float]] = None,
+        device: Union[torch.device, str] = "cpu",
     ):
         vertices  = np.asarray(vertices,  dtype=np.float64)
         triangles = np.asarray(triangles, dtype=np.int64)
@@ -105,11 +107,11 @@ class MeshRenderer:
         # common case of 4-channel primitives; caller can pass a different C
         # and the buffer will be reallocated once then cached.
         self._out_C: int = 0
-        self._out_buf: torch.Tensor | None = None
+        self._out_buf: Optional[torch.Tensor] = None
 
     def render(
         self,
-        vertex_values: torch.Tensor | np.ndarray,
+        vertex_values: Union[torch.Tensor, np.ndarray],
         fill: float = 0.0,
     ) -> torch.Tensor:
         """
@@ -144,7 +146,7 @@ class MeshRenderer:
 
     def render_cell(
         self,
-        cell_values: torch.Tensor | np.ndarray,
+        cell_values: Union[torch.Tensor, np.ndarray],
         fill: float = 0.0,
     ) -> torch.Tensor:
         """
@@ -176,7 +178,7 @@ class MeshRenderer:
 
     def render_cell_smooth(
         self,
-        cell_values: torch.Tensor | np.ndarray,
+        cell_values: Union[torch.Tensor, np.ndarray],
         fill: float = 0.0,
     ) -> torch.Tensor:
         """
@@ -240,7 +242,7 @@ class MeshRenderer:
     def from_cache(
         cls,
         path: str,
-        device: torch.device | str = "cpu",
+        device: Union[torch.device, str] = "cpu",
     ) -> "MeshRenderer":
         """
         Restore a MeshRenderer from a cache file, bypassing the trifinder
@@ -267,7 +269,7 @@ class MeshRenderer:
         obj._out_buf      = None
         return obj
 
-    def to(self, device: torch.device | str) -> "MeshRenderer":
+    def to(self, device: Union[torch.device, str]) -> "MeshRenderer":
         """Move precomputed tensors to a new device in-place, returning self."""
         device = torch.device(device)
         self._interior_idx = self._interior_idx.to(device)
@@ -280,7 +282,7 @@ class MeshRenderer:
         self._device       = device
         return self
 
-def _to_float32(x: torch.Tensor | np.ndarray, device: torch.device) -> torch.Tensor:
+def _to_float32(x: Union[torch.Tensor, np.ndarray], device: torch.device) -> torch.Tensor:
     if isinstance(x, np.ndarray):
         # as_tensor avoids a copy when array is already float32 C-contiguous
         return torch.as_tensor(x, dtype=torch.float32).to(device)
@@ -290,12 +292,12 @@ def _to_float32(x: torch.Tensor | np.ndarray, device: torch.device) -> torch.Ten
 def render_mesh_to_grid(
     vertices: np.ndarray,
     triangles: np.ndarray,
-    values: np.ndarray | torch.Tensor,
+    values: Union[np.ndarray, torch.Tensor],
     resolution: tuple[int, int] = (224, 224),
-    xlim: tuple[float, float] | None = None,
-    ylim: tuple[float, float] | None = None,
+    xlim: Optional[tuple[float, float]] = None,
+    ylim: Optional[tuple[float, float]] = None,
     fill: float = 0.0,
-    device: torch.device | str = "cpu",
+    device: Union[torch.device, str] = "cpu",
 ) -> torch.Tensor:
     """
     One-shot render of per-vertex values onto a fixed pixel grid.
@@ -310,12 +312,12 @@ def render_mesh_to_grid(
 
 
 def render_from_files(
-    mesh_path: str | Path,
-    values_path: str | Path,
-    cache_path: str | Path,
+    mesh_path: Union[str, Path],
+    values_path: Union[str, Path],
+    cache_path: Union[str, Path],
     resolution: tuple[int, int] = (224, 224),
     write_cache: bool = False,
-    device: torch.device | str = "cpu",
+    device: Union[torch.device, str] = "cpu",
     fill: float = 0.0,
 ) -> torch.Tensor:
     """
