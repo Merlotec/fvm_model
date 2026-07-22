@@ -116,6 +116,10 @@ class GenConfig:
     max_A: Optional[float] = None
     lnscale: Optional[float] = None
 
+    # Collider count is geometry, so it is drawn per mesh (inclusive range), not per run.
+    min_colliders: int = 1
+    max_colliders: int = 4
+
     # Per-run sampling.  Categorical specs use {"choices": [...]}, continuous use
     # {"dist": "lognormal"|"uniform"|"loguniform", ...} or {"values": [...]}.
     param_specs: dict[str, dict] = field(default_factory=dict)
@@ -134,9 +138,18 @@ def _make_base_cfg(problem: str):
 
 def apply_overrides(cfg, overrides: dict[str, Any]):
     """Deep-copy cfg and apply field overrides.  visc_model strings are mapped to
-    the ViscosityModel enum; BC params propagate to inlet_cfg + exit_cfg."""
+    the ViscosityModel enum; BC params propagate to inlet_cfg + exit_cfg.
+
+    `aoa_deg` is consumed here rather than set on the config: together with the speed
+    (v_n_inf) it becomes the freestream vector `v_inf`, which the solver projects onto
+    each boundary face.  That is what lets the stream arrive at an arbitrary angle
+    instead of only along +x.
+    """
     cfg = deepcopy(cfg)
+    aoa_deg = overrides.get("aoa_deg")
     for key, value in overrides.items():
+        if key == "aoa_deg":
+            continue
         if key == "visc_model" and isinstance(value, str):
             value = _S["ViscosityModel"][value]
         if key in _BC_PARAMS:
@@ -147,6 +160,19 @@ def apply_overrides(cfg, overrides: dict[str, Any]):
             if not hasattr(cfg, key):
                 raise AttributeError(f"ConfigFVM has no field '{key}'")
             setattr(cfg, key, value)
+
+    if aoa_deg is not None:
+        # Speed from the inlet config (v_n_inf is inward-positive there); direction from
+        # the sampled angle.  Both BC configs get the same vector — with one freestream
+        # around the whole boundary there is no longer a separate inlet/exit direction.
+        theta = np.deg2rad(float(aoa_deg))
+        speed = abs(float(cfg.inlet_cfg.v_n_inf))
+        v_inf = (speed * float(np.cos(theta)), speed * float(np.sin(theta)))
+        for bc in (cfg.inlet_cfg, cfg.exit_cfg):
+            # hasattr guards the nozzle, whose BC configs do not declare v_inf: its flow
+            # is pressure-driven (v_n_inf = 0) and must not be given a freestream.
+            if bc is not None and hasattr(bc, "v_inf"):
+                bc.v_inf = v_inf
     return cfg
 
 
@@ -190,6 +216,8 @@ def run_gen(gen: GenConfig, dry_run: bool = False):
     for m in range(gen.n_meshes):
         problem = str(rng.choice(problems))
         mesh_uid = secrets.token_hex(4)
+        # Collider count is geometry, so it varies per mesh rather than per run.
+        n_colliders = int(rng.integers(gen.min_colliders, gen.max_colliders + 1))
         # one dataset dir per collider geometry (shared_mesh.pkl + its runs), so each
         # is directly consumable by FVMDataModule / the renderer.  n_meshes==1 keeps
         # a flat single-mesh dataset at the root for the legacy pipeline.
@@ -198,8 +226,12 @@ def run_gen(gen: GenConfig, dry_run: bool = False):
 
         base_cfg = mesh = edge_tag = bound_edgs = None
         if not dry_run:
-            base_cfg = apply_overrides(_make_base_cfg(problem), mesh_over or {})
-            print(f"[mesh {m + 1}/{gen.n_meshes}] problem={problem} — collider geometry ({mesh_uid})")
+            mesh_cfg_over = dict(mesh_over or {})
+            if problem == "ellipse":
+                mesh_cfg_over["n_colliders"] = n_colliders
+            base_cfg = apply_overrides(_make_base_cfg(problem), mesh_cfg_over)
+            print(f"[mesh {m + 1}/{gen.n_meshes}] problem={problem} — collider geometry "
+                  f"({mesh_uid}, n_colliders={n_colliders})")
             Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = _S["generate_mesh"](base_cfg)
             mesh = _S["FVMMesh2D"](Xs, tri_idx, all_edgs, bc_edge_mask, device=base_cfg.device)
             with open(os.path.join(mesh_dir, "shared_mesh.pkl"), "wb") as f:
@@ -212,11 +244,12 @@ def run_gen(gen: GenConfig, dry_run: bool = False):
             run_uid = secrets.token_hex(4)
             run_dir = os.path.join(mesh_dir, f"run_{r:04d}_{run_uid}")
             os.makedirs(run_dir, exist_ok=True)
-            record = {**params, "problem": problem, "mesh_uid": mesh_uid}
+            record = {**params, "problem": problem, "mesh_uid": mesh_uid,
+                      "n_colliders": n_colliders}
             with open(os.path.join(run_dir, "params.json"), "w") as f:
                 json.dump(record, f, indent=2)
             manifest["runs"].append({"mesh": mesh_uid, "problem": problem,
-                                     "run": run_uid, **params})
+                                     "run": run_uid, "n_colliders": n_colliders, **params})
 
             desc = ", ".join(f"{k}={v}" if isinstance(v, str) else f"{k}={v:.3g}"
                              for k, v in params.items())

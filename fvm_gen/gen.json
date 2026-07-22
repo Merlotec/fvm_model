@@ -11,6 +11,9 @@
 
   "output_subdir": "fvm_gen_v2",
 
+  "min_colliders": 1,
+  "max_colliders": 4,
+
   "param_specs": {
     "visc_model":       {"choices": ["Newtonian", "PowerLaw", "Carreau", "HerschelBulkley"]},
     "visc_n":           {"dist": "uniform",   "low": 0.3,  "high": 1.8},
@@ -26,7 +29,7 @@
     "rho_inf":          {"dist": "uniform",   "low": 0.5,  "high": 2.0},
     "T_inf":            {"dist": "uniform",   "low": 80.0, "high": 140.0},
     "v_n_inf":          {"dist": "uniform",   "low": 2.0,  "high": 7.0},
-    "v_t_inf":          {"dist": "uniform",   "low": -4.0, "high": 4.0}
+    "aoa_deg":          {"dist": "uniform",   "low": 0.0,  "high": 360.0}
   },
 
   "phys_overrides": {}
