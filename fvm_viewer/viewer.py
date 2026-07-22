@@ -17,6 +17,11 @@ Usage
     # n_meshes > 1) — pick the mesh from the sidebar dropdown, then the run:
     python viewer.py path/to/fvm_gen_v2/
 
+    # Sample a subset of a large sweep instead of loading all of it:
+    #   -s/--sample N   at most N runs per mesh
+    #   -m/--meshes M   at most M meshes
+    python viewer.py path/to/fvm_gen_v2/ -m 3 -s 4
+
     # Compare real vs generated side-by-side (-c):
     python viewer.py path/to/fvm_gen_datasets/ -c path/to/infer_out/
 
@@ -263,6 +268,46 @@ def run_label(root_dir: str, run_dir: str) -> str:
     """Path relative to the dataset root, so multi-mesh runs read as mesh_<uid>/run_<uid>."""
     rel = os.path.relpath(run_dir, root_dir)
     return os.path.basename(run_dir) if rel == "." else rel
+
+
+def _spread(seq: list, n: Optional[int]) -> list:
+    """Take `n` items spread evenly across `seq` (always including the first and last).
+
+    Evenly spread rather than the first n, so a sampled subset still spans the parameter
+    sweep instead of clustering on whatever sorted first.  Deterministic — no seed to
+    record or reproduce.
+    """
+    if n is None or n >= len(seq):
+        return seq
+    if n <= 0:
+        return []
+    if n == 1:
+        return [seq[0]]
+    idx = sorted({round(i * (len(seq) - 1) / (n - 1)) for i in range(n)})
+    return [seq[i] for i in idx]
+
+
+def subsample_runs(run_dirs: list[str], per_mesh: Optional[int] = None,
+                   max_meshes: Optional[int] = None) -> list[str]:
+    """Trim discovered runs to a subset, keeping mesh grouping intact.
+
+    Applied at discovery time, before renderers / frame listings / params are touched —
+    so a sampled open of a big sweep never pays for the runs it drops.  `max_meshes` is
+    the bigger lever: renderers are built per mesh, so dropping meshes is what actually
+    cuts startup work.
+    """
+    if per_mesh is None and max_meshes is None:
+        return run_dirs
+
+    groups: dict[str, list[str]] = {}
+    for d in run_dirs:
+        groups.setdefault(os.path.dirname(d), []).append(d)
+
+    kept_meshes = _spread(sorted(groups), max_meshes)
+    out: list[str] = []
+    for parent in kept_meshes:
+        out.extend(_spread(groups[parent], per_mesh))
+    return sorted(out)
 
 
 def group_by_mesh_dir(root_dir: str, run_dirs: list[str]) -> tuple[list[dict], list[list[dict]]]:
@@ -600,13 +645,17 @@ def _keyboard_js(app: dash.Dash) -> None:
 # Normal viewer
 # ---------------------------------------------------------------------------
 
-def build_app(root_dir: str) -> dash.Dash:
+def build_app(root_dir: str, sample: Optional[int] = None,
+              max_meshes: Optional[int] = None) -> dash.Dash:
     root_abs = os.path.abspath(root_dir)
     run_dirs = find_run_dirs(root_abs)
+    n_found  = len(run_dirs)
+    run_dirs = subsample_runs(run_dirs, sample, max_meshes)
     mesh_options, mesh_run_options = group_by_mesh_dir(root_abs, run_dirs)
     labels = [run_label(root_abs, d) for d in run_dirs]
 
-    print(f"Found {len(run_dirs)} run(s) across {len(mesh_options)} mesh dir(s).")
+    sampled = f" (sampled from {n_found})" if len(run_dirs) != n_found else ""
+    print(f"Found {len(run_dirs)} run(s){sampled} across {len(mesh_options)} mesh dir(s).")
     print("Precomputing renderers...")
     renderers: dict[str, MeshRenderer] = build_renderers(run_dirs, RESOLUTION)
     all_files: dict[str, list[str]]    = {d: find_timestep_files(d) for d in run_dirs}
@@ -786,7 +835,8 @@ def build_app(root_dir: str) -> dash.Dash:
 # Compare viewer
 # ---------------------------------------------------------------------------
 
-def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
+def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = None,
+                      max_meshes: Optional[int] = None) -> dash.Dash:
     """
     Side-by-side viewer: real data on top row, generated predictions on bottom row.
     Only runs present in both directories are listed.
@@ -825,9 +875,19 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
             f"  Gen:  {sorted(run_label(gen_root_abs, d) for d in gen_dirs)}"
         )
 
+    # Sample the matched set, not the two sides independently, so pairing is preserved.
+    n_matched = len(run_names)
+    kept = set(subsample_runs(real_run_dirs, sample, max_meshes))
+    if len(kept) != len(real_run_dirs):
+        keep_i       = [i for i, d in enumerate(real_run_dirs) if d in kept]
+        run_names     = [run_names[i] for i in keep_i]
+        real_run_dirs = [real_run_dirs[i] for i in keep_i]
+        gen_run_dirs  = [gen_run_dirs[i] for i in keep_i]
+
     mesh_options, mesh_run_options = group_by_mesh_dir(real_root_abs, real_run_dirs)
-    print(f"Found {len(run_names)} common run(s) across {len(mesh_options)} mesh dir(s), "
-          f"matched by {matched_by}.")
+    sampled = f" (sampled from {n_matched})" if len(run_names) != n_matched else ""
+    print(f"Found {len(run_names)} common run(s){sampled} across {len(mesh_options)} "
+          f"mesh dir(s), matched by {matched_by}.")
 
     # Detect render resolution from the first available gen frame; fall back to RESOLUTION
     gen_files_map:  dict[str, list[str]]    = {d: find_timestep_files(d) for d in gen_run_dirs}
@@ -1100,6 +1160,13 @@ def main():
     parser.add_argument("-c", "--compare", metavar="GEN_DIR", default=None,
                         help="Generated data directory to compare against. "
                              "Only runs present in both directories will be shown.")
+    parser.add_argument("-s", "--sample", type=int, default=None, metavar="N",
+                        help="Load at most N runs per mesh, spread evenly across each "
+                             "mesh's runs. Sampling happens before any data is read, so "
+                             "a big sweep opens without loading every run.")
+    parser.add_argument("-m", "--meshes", type=int, default=None, metavar="M",
+                        help="Load at most M mesh dirs, spread evenly. Renderers are "
+                             "built per mesh, so this is the bigger startup saving.")
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--host", default="127.0.0.1",
                         help="127.0.0.1 for SSH port-forwarding, 0.0.0.0 for direct access")
@@ -1110,9 +1177,9 @@ def main():
         _LUT[_cmap] = _build_lut(_cmap)
 
     if args.compare:
-        app = build_compare_app(args.directory, args.compare)
+        app = build_compare_app(args.directory, args.compare, args.sample, args.meshes)
     else:
-        app = build_app(args.directory)
+        app = build_app(args.directory, args.sample, args.meshes)
 
     print(f"\n  FVM Viewer running at  http://{args.host}:{args.port}/")
     if args.host == "127.0.0.1":
