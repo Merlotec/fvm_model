@@ -1,2 +1,2 @@
-python fvm_gen/run_sweep.py fvm_gen/sweep.json
+python3 fvm_gen/run_gen.py fvm_gen/gen.json
 

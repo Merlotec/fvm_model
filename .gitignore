@@ -47,5 +47,6 @@ lightning_logs
 
 # Data
 data
+data-bk
 checkpoints*
 out
