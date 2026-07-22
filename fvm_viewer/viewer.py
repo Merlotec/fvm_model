@@ -13,6 +13,10 @@ Usage
     # Dataset directory (contains multiple run sub-dirs):
     python viewer.py path/to/fvm_gen_datasets/
 
+    # Multi-mesh dataset (root/mesh_<uid>/run_<uid>/, as written by run_gen.py when
+    # n_meshes > 1) — pick the mesh from the sidebar dropdown, then the run:
+    python viewer.py path/to/fvm_gen_v2/
+
     # Compare real vs generated side-by-side (-c):
     python viewer.py path/to/fvm_gen_datasets/ -c path/to/infer_out/
 
@@ -32,6 +36,7 @@ HPC port-forwarding
 Navigation
 ----------
     Click a run name on the left panel to switch runs.
+    For multi-mesh datasets, the Mesh dropdown above the run list filters runs to one mesh.
     Use Prev / Next buttons or the slider to move between timesteps.
     Use the "Show Δ / Show Values" toggle to switch between absolute values and deltas.
     Plotly figures support scroll-to-zoom and drag-to-pan.
@@ -51,6 +56,27 @@ from dash import dcc, html, Input, Output, State, callback_context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
 from renderer import MeshRenderer
+
+
+def _add_solver_to_path() -> None:
+    """Put the FVM solver on sys.path so shared_mesh.pkl can be unpickled.
+
+    Multi-mesh datasets store the geometry once per mesh as a pickled FVMMesh2D, so
+    reading one needs `time_fvm` importable — unlike the old per-run mesh_props.npz,
+    which is plain numpy.  Mirrors run_gen.py: the `fvm_solver` fork beside this repo,
+    overridable with FVM_SOLVER_DIR.  Silent if absent — datasets that only use
+    mesh_props.npz do not need the solver at all.
+    """
+    default_solver = str(Path(__file__).resolve().parents[2] / 'fvm_solver')
+    solver_dir = os.environ.get("FVM_SOLVER_DIR", default_solver)
+    if not os.path.isdir(solver_dir):
+        return
+    for p in (solver_dir, os.path.join(solver_dir, "time_fvm")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+
+_add_solver_to_path()
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 RESOLUTION  = (512, 512)
@@ -178,19 +204,42 @@ def _has_frames(d: str) -> bool:
     return any(f.startswith("t_") and f.endswith(".npz") for f in os.listdir(d))
 
 
-def find_run_dirs(root_dir: str) -> list[str]:
-    # Single run dir (old format: mesh_props.npz present; new format: t_*.npz present)
-    if os.path.exists(os.path.join(root_dir, "mesh_props.npz")) or _has_frames(root_dir):
-        return [root_dir]
-    runs = sorted(
-        os.path.join(root_dir, name)
-        for name in os.listdir(root_dir)
-        if os.path.isdir(os.path.join(root_dir, name))
-        and (
-            os.path.exists(os.path.join(root_dir, name, "mesh_props.npz"))
-            or _has_frames(os.path.join(root_dir, name))
-        )
+def _is_run_dir(d: str) -> bool:
+    """A run dir either carries its own mesh (old format) or just frames (new format)."""
+    return os.path.exists(os.path.join(d, "mesh_props.npz")) or _has_frames(d)
+
+
+def _subdirs(d: str) -> list[str]:
+    return sorted(
+        os.path.join(d, name) for name in os.listdir(d)
+        if os.path.isdir(os.path.join(d, name))
     )
+
+
+def _collect_run_dirs(root_dir: str) -> list[str]:
+    """Discover run dirs under `root_dir`, handling both dataset layouts:
+
+      flat (n_meshes == 1):   root/shared_mesh.pkl + root/run_XXXX_<uid>/
+      multi-mesh:             root/mesh_<uid>/shared_mesh.pkl + .../run_XXXX_<uid>/
+
+    Both are scanned, so a root mixing the two still resolves.
+    """
+    if _is_run_dir(root_dir):
+        return [root_dir]
+
+    runs, mesh_dirs = [], []
+    for child in _subdirs(root_dir):
+        (runs if _is_run_dir(child) else mesh_dirs).append(child)
+
+    # One level deeper for the multi-mesh layout: root/mesh_<uid>/run_XXXX_<uid>/
+    for mesh_dir in mesh_dirs:
+        runs.extend(c for c in _subdirs(mesh_dir) if _is_run_dir(c))
+
+    return sorted(runs)
+
+
+def find_run_dirs(root_dir: str) -> list[str]:
+    runs = _collect_run_dirs(root_dir)
     if not runs:
         raise RuntimeError(f"No run directories found under {root_dir}")
     return runs
@@ -198,14 +247,50 @@ def find_run_dirs(root_dir: str) -> list[str]:
 
 def find_gen_run_dirs(root_dir: str) -> list[str]:
     """Find generated-data run dirs (no mesh_props.npz required; just t_*.npz files)."""
-    if _has_frames(root_dir):
-        return [root_dir]
-    return sorted(
-        os.path.join(root_dir, name)
-        for name in os.listdir(root_dir)
-        if os.path.isdir(os.path.join(root_dir, name))
-        and _has_frames(os.path.join(root_dir, name))
-    )
+    return _collect_run_dirs(root_dir)
+
+
+def mesh_key(run_dir: str) -> str:
+    """Directory whose mesh governs `run_dir` — itself for the old per-run mesh_props.npz
+    format, otherwise the parent holding shared_mesh.pkl.  Runs sharing a key share a
+    renderer, so a multi-mesh dataset builds one renderer per mesh, not per run."""
+    if os.path.exists(os.path.join(run_dir, "mesh_props.npz")):
+        return run_dir
+    return os.path.dirname(run_dir)
+
+
+def run_label(root_dir: str, run_dir: str) -> str:
+    """Path relative to the dataset root, so multi-mesh runs read as mesh_<uid>/run_<uid>."""
+    rel = os.path.relpath(run_dir, root_dir)
+    return os.path.basename(run_dir) if rel == "." else rel
+
+
+def group_by_mesh_dir(root_dir: str, run_dirs: list[str]) -> tuple[list[dict], list[list[dict]]]:
+    """Group runs by the directory that contains them, for the sidebar's mesh filter.
+
+    Grouping is by parent dir rather than by `mesh_key`, because in the old flat format
+    every run carries its own mesh_props.npz — keying on the mesh would yield one group
+    per run.  Parent dir gives one group for a flat dataset and one per mesh_<uid> for a
+    multi-mesh one, which is what the filter should offer.
+
+    Returns (mesh_options, mesh_run_options); run option values are GLOBAL indices into
+    `run_dirs`, so selection state stays mesh-agnostic.
+    """
+    groups: dict[str, list[int]] = {}
+    for i, d in enumerate(run_dirs):
+        groups.setdefault(os.path.dirname(d), []).append(i)
+
+    mesh_options, mesh_run_options = [], []
+    for mi, (parent, idxs) in enumerate(groups.items()):
+        rel = os.path.relpath(parent, root_dir)
+        mesh_options.append({
+            "label": os.path.basename(parent) if rel == "." else rel,
+            "value": mi,
+        })
+        mesh_run_options.append(
+            [{"label": os.path.basename(run_dirs[i]), "value": i} for i in idxs]
+        )
+    return mesh_options, mesh_run_options
 
 
 def load_mesh(run_dir: str) -> dict:
@@ -260,6 +345,23 @@ def build_renderer(run_dir: str, resolution: tuple[int, int]) -> MeshRenderer:
 
     renderer.save_cache(cache_path)
     return renderer
+
+
+def build_renderers(run_dirs: list[str], resolution: tuple[int, int]) -> dict[str, MeshRenderer]:
+    """Map every run dir to a renderer, building only one per distinct mesh.
+
+    In a multi-mesh dataset all runs under a `mesh_<uid>/` share one geometry, so this
+    turns n_meshes x runs_per_mesh renderer builds into n_meshes.
+    """
+    by_mesh: dict[str, MeshRenderer] = {}
+    out: dict[str, MeshRenderer] = {}
+    for d in run_dirs:
+        key = mesh_key(d)
+        if key not in by_mesh:
+            print(f"  mesh {len(by_mesh) + 1}: {os.path.basename(key)}")
+            by_mesh[key] = build_renderer(d, resolution)
+        out[d] = by_mesh[key]
+    return out
 
 
 def find_timestep_files(run_dir: str) -> list[str]:
@@ -425,8 +527,19 @@ def _params_header_str(params: dict) -> str:
     return "   ".join(parts)
 
 
-def _sidebar(run_options: list[dict]) -> html.Div:
+def _sidebar(run_options: list[dict], mesh_options: Optional[list[dict]] = None) -> html.Div:
+    """Run picker, with a mesh dropdown above it for multi-mesh datasets.
+
+    The dropdown is always present so its callback resolves, but stays hidden when the
+    dataset has a single mesh — there is nothing to filter by then.
+    """
+    multi = bool(mesh_options) and len(mesh_options) > 1
     return html.Div([
+        html.Div([
+            html.H4("Mesh", style={"margin": "0 0 6px 0", "fontSize": "13px", "fontWeight": "600"}),
+            dcc.Dropdown(id="mesh-selector", options=mesh_options or [], value=0,
+                         clearable=False, style={"fontSize": "11px"}),
+        ], style={"display": "block" if multi else "none", "marginBottom": "12px"}),
         html.H4("Runs", style={"margin": "0 0 10px 0", "fontSize": "13px", "fontWeight": "600"}),
         dcc.RadioItems(
             id="run-selector", options=run_options, value=0,
@@ -488,16 +601,20 @@ def _keyboard_js(app: dash.Dash) -> None:
 # ---------------------------------------------------------------------------
 
 def build_app(root_dir: str) -> dash.Dash:
-    run_dirs = find_run_dirs(os.path.abspath(root_dir))
+    root_abs = os.path.abspath(root_dir)
+    run_dirs = find_run_dirs(root_abs)
+    mesh_options, mesh_run_options = group_by_mesh_dir(root_abs, run_dirs)
+    labels = [run_label(root_abs, d) for d in run_dirs]
 
+    print(f"Found {len(run_dirs)} run(s) across {len(mesh_options)} mesh dir(s).")
     print("Precomputing renderers...")
-    renderers: dict[str, MeshRenderer] = {d: build_renderer(d, RESOLUTION) for d in run_dirs}
+    renderers: dict[str, MeshRenderer] = build_renderers(run_dirs, RESOLUTION)
     all_files: dict[str, list[str]]    = {d: find_timestep_files(d) for d in run_dirs}
     all_params: list[dict]             = [load_params(d) for d in run_dirs]
     print("Ready.")
 
     app  = dash.Dash(__name__, title="FVM Viewer")
-    opts = [{"label": os.path.basename(d), "value": i} for i, d in enumerate(run_dirs)]
+    opts = mesh_run_options[0]
 
     plot_area = dcc.Loading(type="circle", color="#4a90d9", children=html.Div(
         [
@@ -514,7 +631,7 @@ def build_app(root_dir: str) -> dash.Dash:
             html.Button("Show Δ (Delta)", id="view-toggle", n_clicks=0, style=_TOGGLE_STYLE),
         ], style={"padding": "8px 12px", "borderBottom": "1px solid #ddd", "display": "flex", "alignItems": "baseline"}),
         html.Div([
-            _sidebar(opts),
+            _sidebar(opts, mesh_options),
             html.Div([plot_area, _nav_bar()],
                      style={"flex": "1", "overflow": "auto", "display": "flex", "flexDirection": "column"}),
         ], style={"display": "flex", "flex": "1", "overflow": "hidden"}),
@@ -537,6 +654,20 @@ def build_app(root_dir: str) -> dash.Dash:
         new_mode = "delta" if current_mode == "absolute" else "absolute"
         label = "Show Values" if new_mode == "delta" else "Show Δ (Delta)"
         return new_mode, label
+
+    @app.callback(
+        Output("run-selector", "options"),
+        Output("run-selector", "value"),
+        Input("mesh-selector", "value"),
+        State("state", "data"),
+    )
+    def filter_runs_by_mesh(mesh_idx, state):
+        """Narrow the run list to the selected mesh.  Keeps the current run selected when
+        it belongs to that mesh, so re-picking the same mesh is a no-op."""
+        options = mesh_run_options[mesh_idx or 0]
+        current = (state or {}).get("run_idx", 0)
+        value   = current if any(o["value"] == current for o in options) else options[0]["value"]
+        return options, value
 
     @app.callback(
         Output("state", "data"),
@@ -591,7 +722,7 @@ def build_app(root_dir: str) -> dash.Dash:
             row_label = "Fields"
 
         n      = len(files)
-        header = f"{os.path.basename(run_dir)}   |   step {step_idx + 1}/{n}   |   t = {t:.4g}"
+        header = f"{labels[state['run_idx']]}   |   step {step_idx + 1}/{n}   |   t = {t:.4g}"
         return (*figs, row_label, header, n - 1, step_idx)
 
     @app.callback(
@@ -605,7 +736,8 @@ def build_app(root_dir: str) -> dash.Dash:
     def download_video(_n, state, view_mode):
         run_dir = run_dirs[state["run_idx"]]
         files   = all_files[run_dir]
-        name    = os.path.basename(run_dir)
+        # mesh-qualified so downloads from different meshes don't collide on disk
+        name    = labels[state["run_idx"]].replace(os.sep, "_")
         print(f'Generating video for {name} ({len(files)} frames)...')
 
         # Pass 1: compute global zranges (scalar min/max only — no grids kept in RAM)
@@ -662,25 +794,40 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
     alongside each generated frame.
     A toggle switches both rows between absolute values and deltas.
     """
-    real_dirs = find_run_dirs(os.path.abspath(real_root))
-    gen_dirs  = find_gen_run_dirs(os.path.abspath(gen_root))
+    real_root_abs = os.path.abspath(real_root)
+    gen_root_abs  = os.path.abspath(gen_root)
+    real_dirs = find_run_dirs(real_root_abs)
+    gen_dirs  = find_gen_run_dirs(gen_root_abs)
 
-    real_by_name = {os.path.basename(d): d for d in real_dirs}
-    gen_by_name  = {os.path.basename(d): d for d in gen_dirs}
-    common_names = sorted(real_by_name.keys() & gen_by_name.keys())
+    # Pair runs on the mesh-qualified relative path (mesh_<uid>/run_<uid>) so multi-mesh
+    # datasets stay unambiguous, falling back to the bare run name when the generated
+    # tree is flat but the real one is nested (or vice versa).
+    matched_by = ""
+    run_names: list[str] = []
+    real_run_dirs: list[str] = []
+    gen_run_dirs: list[str] = []
+    for key_fn, what in ((run_label, "relative path"),
+                         (lambda _root, d: os.path.basename(d), "run name")):
+        real_map = {key_fn(real_root_abs, d): d for d in real_dirs}
+        gen_map  = {key_fn(gen_root_abs, d): d for d in gen_dirs}
+        common   = sorted(real_map.keys() & gen_map.keys())
+        if common:
+            run_names     = common
+            real_run_dirs = [real_map[n] for n in common]
+            gen_run_dirs  = [gen_map[n] for n in common]
+            matched_by    = what
+            break
 
-    if not common_names:
+    if not run_names:
         raise RuntimeError(
-            f"No run names in common between {real_root} and {gen_root}.\n"
-            f"  Real: {sorted(real_by_name)}\n"
-            f"  Gen:  {sorted(gen_by_name)}"
+            f"No runs in common between {real_root} and {gen_root}.\n"
+            f"  Real: {sorted(run_label(real_root_abs, d) for d in real_dirs)}\n"
+            f"  Gen:  {sorted(run_label(gen_root_abs, d) for d in gen_dirs)}"
         )
 
-    run_names     = common_names
-    real_run_dirs = [real_by_name[n] for n in run_names]
-    gen_run_dirs  = [gen_by_name[n]  for n in run_names]
-
-    print(f"Found {len(run_names)} common run(s): {run_names}")
+    mesh_options, mesh_run_options = group_by_mesh_dir(real_root_abs, real_run_dirs)
+    print(f"Found {len(run_names)} common run(s) across {len(mesh_options)} mesh dir(s), "
+          f"matched by {matched_by}.")
 
     # Detect render resolution from the first available gen frame; fall back to RESOLUTION
     gen_files_map:  dict[str, list[str]]    = {d: find_timestep_files(d) for d in gen_run_dirs}
@@ -697,7 +844,7 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
             break
 
     print("Precomputing renderers for real data...")
-    renderers:      dict[str, MeshRenderer] = {d: build_renderer(d, render_res) for d in real_run_dirs}
+    renderers:      dict[str, MeshRenderer] = build_renderers(real_run_dirs, render_res)
     real_files_map: dict[str, list[str]]    = {d: find_timestep_files(d) for d in real_run_dirs}
     all_params:     list[dict]              = [load_params(d) for d in real_run_dirs]
     print("Ready.")
@@ -715,7 +862,7 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         n_seed_map[_gd] = max(_n, 1)
 
     app  = dash.Dash(__name__, title="FVM Viewer — Compare")
-    opts = [{"label": name, "value": i} for i, name in enumerate(run_names)]
+    opts = mesh_run_options[0]
 
     plot_area = dcc.Loading(type="circle", color="#4a90d9", children=html.Div(
         [
@@ -740,7 +887,7 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
             html.Button("Show Δ (Delta)", id="view-toggle", n_clicks=0, style=_TOGGLE_STYLE),
         ], style={"padding": "8px 12px", "borderBottom": "1px solid #ddd", "display": "flex", "alignItems": "baseline"}),
         html.Div([
-            _sidebar(opts),
+            _sidebar(opts, mesh_options),
             html.Div([plot_area, _nav_bar()],
                      style={"flex": "1", "overflow": "auto", "display": "flex", "flexDirection": "column"}),
         ], style={"display": "flex", "flex": "1", "overflow": "hidden"}),
@@ -763,6 +910,20 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         new_mode = "delta" if current_mode == "absolute" else "absolute"
         label = "Show Values" if new_mode == "delta" else "Show Δ (Delta)"
         return new_mode, label
+
+    @app.callback(
+        Output("run-selector", "options"),
+        Output("run-selector", "value"),
+        Input("mesh-selector", "value"),
+        State("state", "data"),
+    )
+    def filter_runs_by_mesh(mesh_idx, state):
+        """Narrow the run list to the selected mesh.  Keeps the current run selected when
+        it belongs to that mesh, so re-picking the same mesh is a no-op."""
+        options = mesh_run_options[mesh_idx or 0]
+        current = (state or {}).get("run_idx", 0)
+        value   = current if any(o["value"] == current for o in options) else options[0]["value"]
+        return options, value
 
     @app.callback(
         Output("state", "data"),
@@ -875,7 +1036,8 @@ def build_compare_app(real_root: str, gen_root: str) -> dash.Dash:
         gen_dir    = gen_run_dirs[run_idx]
         gen_files  = gen_files_map[gen_dir]
         real_files = real_files_map[real_dir]
-        name       = run_names[run_idx]
+        # run_names may be mesh-qualified (mesh_<uid>/run_<uid>) — flatten for the filename
+        name       = run_names[run_idx].replace(os.sep, "_")
         print(f'Generating comparison video for {name} ({len(gen_files)} frames)...')
 
         # Pass 1: scalar min/max only
