@@ -189,9 +189,25 @@ def _sample_run(gen: GenConfig, rng: np.random.Generator) -> dict[str, Any]:
     return {name: _sample_one(name, spec, rng) for name, spec in gen.param_specs.items()}
 
 
-def run_gen(gen: GenConfig, dry_run: bool = False):
+def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None):
+    # Without param_specs there is nothing to vary per run: every run on a mesh gets
+    # identical overrides and the solver is deterministic, so they come out identical.
+    # This is silent and expensive (it burns runs_per_mesh x compute for one result),
+    # so refuse rather than let a sweep run with no sweep in it.
+    if not gen.param_specs and gen.runs_per_mesh > 1:
+        raise SystemExit(
+            f"param_specs is empty but runs_per_mesh={gen.runs_per_mesh}: every run on a "
+            f"mesh would be identical.\n"
+            f"  Pass a sweep config:  python fvm_gen/run_gen.py fvm_gen/gen.json\n"
+            f"  Or set runs_per_mesh=1 if you really want one run per geometry."
+        )
+
     rng = np.random.default_rng(gen.seed)
-    out_root = os.path.join(_DEFAULT_DATA_DIR, gen.output_subdir)
+    # Output dir precedence: explicit --out-dir (used as the root directly) >
+    # data/<output_subdir> default.  Lets a caller drop the dataset on a specific
+    # filesystem (e.g. Dawn's /rds scratch) without editing the config.
+    out_root = os.path.abspath(out_dir) if out_dir else os.path.join(
+        _DEFAULT_DATA_DIR, gen.output_subdir)
     # `problem` may be a single setup or a list to mix (e.g. ["ellipse","nozzle"]),
     # sampled per mesh so the dataset spans different BC topologies.
     problems = gen.problem if isinstance(gen.problem, list) else [gen.problem]
@@ -289,6 +305,9 @@ if __name__ == "__main__":
     p.add_argument("config", nargs="?", help="path to a gen.json sweep config")
     p.add_argument("--dry-run", action="store_true",
                    help="sample the sweep and write params.json/manifest without running the solver")
+    p.add_argument("-o", "--out-dir", default=None,
+                   help="output directory (used as the dataset root directly); "
+                        "overrides the data/<output_subdir> default")
     args = p.parse_args()
     cfg = gen_from_file(args.config) if args.config else GenConfig()
-    run_gen(cfg, dry_run=args.dry_run)
+    run_gen(cfg, dry_run=args.dry_run, out_dir=args.out_dir)
