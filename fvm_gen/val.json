@@ -1,7 +1,8 @@
 {
   "_comment": "VALIDATION sweep — same parameter distribution as gen.json (identical context_param_specs / ic_param_specs / colliders / solver settings), but a DIFFERENT seed so both the meshes and the sampled systems are unseen. n_meshes=9 gives 9 distinct collider geometries, i.e. 9 self-contained validation datasets (one mesh dir each). n_context/n_ic are smaller than training only to keep the validation set modest — they are sample COUNTS, not the distribution, so 'same distribution' is preserved. Generate with -o so it lands in data/fvm_validation:  python fvm_model/fvm_gen/run_gen.py fvm_model/fvm_gen/val.json -o ../data/fvm_validation",
 
-  "problem": ["ellipse", "nozzle"],
+  "_problem_note": "ELLIPSE ONLY, on purpose: the nozzle mesh generator fails to close its boundary loop (gmsh 'closed loop' error, on Mac AND the cluster), so no nozzle run ever reached the training data — it is 100% ellipse. Matching that means ellipse only; adding nozzle would make validation mismatch the real training distribution and abort on the bad mesh.",
+  "problem": "ellipse",
   "n_meshes": 9,
   "n_context": 6,
   "n_ic": 4,

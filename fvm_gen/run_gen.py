@@ -44,6 +44,10 @@ _DEFAULT_DATA_DIR = os.path.abspath(os.path.join(_HERE, "..", "..", "data"))
 
 _S: dict[str, Any] = {}     # lazily-populated handle on solver symbols
 
+# Max geometry draws per mesh slot before giving up (mesh gen is fragile for
+# some random collider layouts — see the retry loop in run_gen).
+MAX_MESH_TRIES = 12
+
 
 def _import_solver():
     """Add the FVM solver to sys.path and import what we need.  Imports are lazy so
@@ -279,29 +283,54 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
                 "runs_per_mesh": None if grid_mode else gen.runs_per_mesh, "runs": []}
 
     for m in range(gen.n_meshes):
-        problem = str(rng.choice(problems))
         mesh_uid = secrets.token_hex(4)
-        # Collider count is geometry, so it varies per mesh rather than per run.
-        n_colliders = int(rng.integers(gen.min_colliders, gen.max_colliders + 1))
         # one dataset dir per collider geometry (shared_mesh.pkl + its runs), so each
         # is directly consumable by FVMDataModule / the renderer.  n_meshes==1 keeps
         # a flat single-mesh dataset at the root for the legacy pipeline.
         mesh_dir = out_root if gen.n_meshes == 1 else os.path.join(out_root, f"mesh_{mesh_uid}")
-        os.makedirs(mesh_dir, exist_ok=True)
 
         base_cfg = mesh = edge_tag = bound_edgs = None
+        problem, n_colliders = None, 0
         if not dry_run:
-            mesh_cfg_over = dict(mesh_over or {})
-            if problem == "ellipse":
-                mesh_cfg_over["n_colliders"] = n_colliders
-            base_cfg = apply_overrides(_make_base_cfg(problem), mesh_cfg_over)
+            # Draw the geometry with RETRIES.  gmsh occasionally fails to close the
+            # boundary loop for a fragile draw ("1D mesh not forming a closed loop";
+            # seen with nozzle, but any random collider layout can trip it), and the
+            # draw is deterministic per RNG state so a plain re-run would fail the
+            # same way.  Re-draw problem / collider count / geometry — each call
+            # advances the RNG generate_mesh samples — so a bad mesh costs one retry,
+            # not the whole (multi-hour) sweep.  Not platform-specific: reproduces on
+            # Mac and the cluster; it is the mesh generator, not gmsh's install.
+            for attempt in range(MAX_MESH_TRIES):
+                problem = str(rng.choice(problems))
+                # Collider count is geometry, so it varies per mesh, not per run.
+                n_colliders = int(rng.integers(gen.min_colliders, gen.max_colliders + 1))
+                mesh_cfg_over = dict(mesh_over or {})
+                if problem == "ellipse":
+                    mesh_cfg_over["n_colliders"] = n_colliders
+                base_cfg = apply_overrides(_make_base_cfg(problem), mesh_cfg_over)
+                try:
+                    Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = \
+                        _S["generate_mesh"](base_cfg)
+                    mesh = _S["FVMMesh2D"](Xs, tri_idx, all_edgs, bc_edge_mask,
+                                           device=base_cfg.device)
+                    break
+                except Exception as e:
+                    print(f"    !! mesh gen failed (attempt {attempt + 1}/{MAX_MESH_TRIES}, "
+                          f"problem={problem}): {type(e).__name__}: {e}")
+                    mesh = None
+            if mesh is None:
+                print(f"[mesh {m + 1}/{gen.n_meshes}] SKIPPED — all {MAX_MESH_TRIES} "
+                      f"mesh-gen attempts failed")
+                continue
+            os.makedirs(mesh_dir, exist_ok=True)   # only after a mesh actually builds
             print(f"[mesh {m + 1}/{gen.n_meshes}] problem={problem} — collider geometry "
                   f"({mesh_uid}, n_colliders={n_colliders})")
-            Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = _S["generate_mesh"](base_cfg)
-            mesh = _S["FVMMesh2D"](Xs, tri_idx, all_edgs, bc_edge_mask, device=base_cfg.device)
             with open(os.path.join(mesh_dir, "shared_mesh.pkl"), "wb") as f:
                 pickle.dump({"mesh": mesh, "edge_tag": edge_tag, "bound_edgs": bound_edgs}, f)
         else:
+            problem = str(rng.choice(problems))
+            n_colliders = int(rng.integers(gen.min_colliders, gen.max_colliders + 1))
+            os.makedirs(mesh_dir, exist_ok=True)
             print(f"[mesh {m + 1}/{gen.n_meshes}] problem={problem} ({mesh_uid})")
 
         # ---- build this mesh's run plan -------------------------------------
