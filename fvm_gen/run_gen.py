@@ -101,8 +101,36 @@ def _sample_one(name: str, spec: dict, rng: np.random.Generator):
 class GenConfig:
     problem: "Union[str, list]" = "ellipse"  # "ellipse" | "nozzle" | a list to mix per mesh
     n_meshes: int = 8                 # distinct collider geometries
-    runs_per_mesh: int = 16           # parameter draws per geometry
+    runs_per_mesh: int = 16           # LEGACY mode only: parameter draws per geometry
     seed: int = 42
+
+    # --- in-context grid mode (preferred) --------------------------------------
+    # The model must INFER the context (hidden physics) from observed transitions,
+    # not memorise "what a frame under context X looks like".  That shortcut is
+    # only foreclosed if the SAME starting frame appears under MANY contexts, so
+    # its next frame is genuinely ambiguous without the context.
+    #
+    # The FVM initial condition depends only on the freestream/BC params
+    # (rho_inf, T_inf, v_n_inf, aoa) and C_v — NOT on viscosity/gamma/thermal_cond/
+    # bulk-viscosity/visc-model.  So we can hold the IC fixed and vary only the
+    # hidden physics.  Per mesh we sample:
+    #   * n_context physics draws  -> each is one SYSTEM (the thing to infer)
+    #   * n_ic freestream draws    -> shared initial conditions
+    # and run the full n_context x n_ic grid:
+    #   - a column (fixed physics, varying IC) = one system with many ICs
+    #     -> the demonstration regime (context from sibling trajectories)
+    #   - a row (fixed IC, varying physics) = the SAME start frame under many
+    #     contexts -> forces the model to actually use the context.
+    #
+    # params.json carries ONLY the context (physics) params, so it is identical
+    # across a column and mfm/data.py groups the column into one multi-IC system
+    # with no consumer-side change.  The per-run freestream/IC draw is written to
+    # ic.json (which grouping ignores).  Leave BOTH of these empty to fall back to
+    # the legacy per-run `param_specs` sampling.
+    n_context: int = 12               # physics-parameter sets (systems) per mesh
+    n_ic: int = 6                     # shared initial-condition seeds per mesh
+    context_param_specs: dict[str, dict] = field(default_factory=dict)
+    ic_param_specs: dict[str, dict] = field(default_factory=dict)
 
     # Solver run controls (applied to every run).
     save_t: float = 0.01              # sim-time between saved frames
@@ -184,22 +212,40 @@ def _init_conds(cfg, mesh, edge_tag, bound_edgs, phy):
     raise ValueError(f"Unknown problem_setup '{cfg.problem_setup}'")
 
 
+def _sample_specs(specs: dict[str, dict], rng: np.random.Generator) -> dict[str, Any]:
+    """Draw one value per named spec (categorical + continuous)."""
+    return {name: _sample_one(name, spec, rng) for name, spec in specs.items()}
+
+
 def _sample_run(gen: GenConfig, rng: np.random.Generator) -> dict[str, Any]:
     """One run's parameter draw (categorical + continuous)."""
-    return {name: _sample_one(name, spec, rng) for name, spec in gen.param_specs.items()}
+    return _sample_specs(gen.param_specs, rng)
 
 
 def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None):
-    # Without param_specs there is nothing to vary per run: every run on a mesh gets
-    # identical overrides and the solver is deterministic, so they come out identical.
-    # This is silent and expensive (it burns runs_per_mesh x compute for one result),
-    # so refuse rather than let a sweep run with no sweep in it.
-    if not gen.param_specs and gen.runs_per_mesh > 1:
+    # Grid mode is selected by providing context_param_specs and/or ic_param_specs.
+    grid_mode = bool(gen.context_param_specs or gen.ic_param_specs)
+
+    if grid_mode:
+        # The shared-IC grid only foreclosures the shortcut if there is more than
+        # one context to disambiguate AND more than one IC per system (so the
+        # demonstration regime has sibling trajectories).  n_ic == 1 would give
+        # single-trajectory systems; n_context == 1 would give one context.
+        if gen.n_context < 2 or gen.n_ic < 2:
+            raise SystemExit(
+                f"grid mode needs n_context>=2 and n_ic>=2 to force context use "
+                f"(got n_context={gen.n_context}, n_ic={gen.n_ic}).\n"
+                f"  n_context<2 -> nothing to infer; n_ic<2 -> no sibling "
+                f"trajectories for the demonstration regime."
+            )
+    elif not gen.param_specs and gen.runs_per_mesh > 1:
+        # Legacy mode: without param_specs there is nothing to vary per run, so
+        # every run on a mesh comes out identical (the solver is deterministic).
         raise SystemExit(
             f"param_specs is empty but runs_per_mesh={gen.runs_per_mesh}: every run on a "
             f"mesh would be identical.\n"
-            f"  Pass a sweep config:  python fvm_gen/run_gen.py fvm_gen/gen.json\n"
-            f"  Or set runs_per_mesh=1 if you really want one run per geometry."
+            f"  Use grid mode (context_param_specs + ic_param_specs), pass a sweep "
+            f"config, or set runs_per_mesh=1 for one run per geometry."
         )
 
     rng = np.random.default_rng(gen.seed)
@@ -227,7 +273,10 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
           f"problems: {problems}   dry_run: {dry_run}")
 
     manifest = {"problems": problems, "n_meshes": gen.n_meshes,
-                "runs_per_mesh": gen.runs_per_mesh, "runs": []}
+                "mode": "grid" if grid_mode else "legacy",
+                "n_context": gen.n_context if grid_mode else None,
+                "n_ic": gen.n_ic if grid_mode else None,
+                "runs_per_mesh": None if grid_mode else gen.runs_per_mesh, "runs": []}
 
     for m in range(gen.n_meshes):
         problem = str(rng.choice(problems))
@@ -255,25 +304,61 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
         else:
             print(f"[mesh {m + 1}/{gen.n_meshes}] problem={problem} ({mesh_uid})")
 
-        for r in range(gen.runs_per_mesh):
-            params = _sample_run(gen, rng)
+        # ---- build this mesh's run plan -------------------------------------
+        # Each entry: (label, context_params, ic_params, context_id, ic_id).
+        if grid_mode:
+            # Sample the axes ONCE per mesh, then take the full cartesian product,
+            # so the same n_ic freestream draws are reused across every context —
+            # that reuse is what makes a starting frame recur under many contexts.
+            contexts = [_sample_specs(gen.context_param_specs, rng) for _ in range(gen.n_context)]
+            ics = [_sample_specs(gen.ic_param_specs, rng) for _ in range(gen.n_ic)]
+            run_plan = [(f"c{j:03d}_i{i:03d}", ctx, ic, j, i)
+                        for j, ctx in enumerate(contexts)
+                        for i, ic in enumerate(ics)]
+        else:
+            run_plan = [(f"{r:04d}", _sample_run(gen, rng), {}, None, None)
+                        for r in range(gen.runs_per_mesh)]
+
+        n_runs_mesh = len(run_plan)
+        for idx, (label, context_params, ic_params, cid, iid) in enumerate(run_plan):
             run_uid = secrets.token_hex(4)
-            run_dir = os.path.join(mesh_dir, f"run_{r:04d}_{run_uid}")
+            run_dir = os.path.join(mesh_dir, f"run_{label}_{run_uid}")
             os.makedirs(run_dir, exist_ok=True)
-            record = {**params, "problem": problem, "mesh_uid": mesh_uid,
+
+            # params.json carries ONLY the context (physics) params — identical
+            # across a column of shared ICs — so mfm/data.py groups the column
+            # into one multi-IC system with no consumer-side change.  (problem/
+            # mesh_uid/n_colliders/context_id are constant within a column too, so
+            # they do not split the grouping.)  C_v lives here, not in ic.json,
+            # because the data loader reads it from params.json to convert
+            # primitives -> conserved.
+            record = {**context_params, "problem": problem, "mesh_uid": mesh_uid,
                       "n_colliders": n_colliders}
+            if cid is not None:
+                record["context_id"] = cid
             with open(os.path.join(run_dir, "params.json"), "w") as f:
                 json.dump(record, f, indent=2)
+            # ic.json = the per-run freestream/IC draw.  It varies within a system
+            # and grouping ignores it, so it never splits a system.
+            if grid_mode:
+                with open(os.path.join(run_dir, "ic.json"), "w") as f:
+                    json.dump({**ic_params, "ic_id": iid}, f, indent=2)
+
+            all_params = {**context_params, **ic_params}
             manifest["runs"].append({"mesh": mesh_uid, "problem": problem,
-                                     "run": run_uid, "n_colliders": n_colliders, **params})
+                                     "run": run_uid, "n_colliders": n_colliders,
+                                     "context_id": cid, "ic_id": iid, **all_params})
 
             desc = ", ".join(f"{k}={v}" if isinstance(v, str) else f"{k}={v:.3g}"
-                             for k, v in params.items())
-            print(f"  [mesh {m + 1}/{gen.n_meshes} | run {r + 1}/{gen.runs_per_mesh}] {desc}")
+                             for k, v in all_params.items())
+            print(f"  [mesh {m + 1}/{gen.n_meshes} | run {idx + 1}/{n_runs_mesh}] "
+                  f"{label}: {desc}")
             if dry_run:
                 continue
 
-            overrides = {**params, **gen.phys_overrides,
+            # Both context and IC params drive the solver (the IC params set the
+            # freestream/initial condition; the context params set the physics).
+            overrides = {**all_params, **gen.phys_overrides,
                          "plot": False, "exact_interval": True,   # headless, land on save_t
                          "save_t": gen.save_t, "n_iter": gen.n_iter,
                          "print_i": gen.print_i, "compile": gen.compile,
@@ -297,7 +382,10 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
 
 def gen_from_file(path: str) -> GenConfig:
     with open(path) as f:
-        return GenConfig(**json.load(f))
+        data = json.load(f)
+    # Drop underscore-prefixed keys so a config can carry _comment/_note fields.
+    data = {k: v for k, v in data.items() if not k.startswith("_")}
+    return GenConfig(**data)
 
 
 if __name__ == "__main__":
