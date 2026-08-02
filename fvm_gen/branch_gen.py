@@ -89,14 +89,37 @@ GEOM_META_KEYS  = ("problem", "mesh_uid", "n_colliders")
 # passing them to the config raises AttributeError — and a branch must not inherit
 # them either: `context_id` labels the SOURCE run's system, but a branch is evolved
 # under different physics and so belongs to a different one.
-BOOKKEEPING_KEYS = ("context_id",)
+BOOKKEEPING_KEYS = ("context_id", "ic_id")
 
 # Unknown-config-key names already reported, so the warning prints once per key.
 _WARNED_UNKNOWN_KEYS: set[str] = set()
 
 
+def load_run_params(run_dir: str) -> dict:
+    """A run's full parameter record: params.json ∪ ic.json.
+
+    Older generators put the freestream (rho_inf/T_inf/v_n_inf/aoa_deg) in
+    params.json.  Newer ones write params.json = the CONTEXT (physics) only — so it is
+    identical across runs of one system — and split the per-run freestream/IC draw into
+    a separate `ic.json`.  Reading params.json alone therefore yields an EMPTY
+    freestream on new-schema data, and the branch silently restarts under the solver's
+    DEFAULT boundary conditions while its interior state came from a run with a very
+    different freestream.  That inlet/interior mismatch is a violent transient — the
+    solver NaNs on the first step (t=nan, avg_dt=nan) and then spins to the n_iter cap.
+    Merging both files keeps the freestream consistent with the state, which is exactly
+    what the branch design requires.
+    """
+    out: dict = {}
+    for name in ("params.json", "ic.json"):
+        p = os.path.join(run_dir, name)
+        if os.path.exists(p):
+            with open(p) as f:
+                out.update(json.load(f))
+    return out
+
+
 def split_params(params: dict) -> tuple[dict, dict, dict]:
-    """(physics, freestream, geom_meta) from a run's params.json."""
+    """(physics, freestream, geom_meta) from a run's parameter record."""
     freestream = {k: params[k] for k in FREESTREAM_KEYS if k in params}
     meta       = {k: params[k] for k in GEOM_META_KEYS if k in params}
     physics    = {k: v for k, v in params.items()
@@ -270,8 +293,7 @@ def main():
         # physics palette on this mesh: one physics dict per base run (dedup)
         run_params, physics_palette = {}, []
         for rd in runs:
-            with open(os.path.join(rd, "params.json")) as f:
-                pj = json.load(f)
+            pj = load_run_params(rd)
             run_params[rd] = pj
             physics_palette.append(split_params(pj)[0])
 
@@ -315,9 +337,18 @@ def main():
                 chosen = [others[i] for i in oidx]
             targets = [src_physics] + chosen        # index 0 = self (native demo)
 
+            # Mirror the source layout.  New-schema runs keep params.json = CONTEXT
+            # (physics) only and put the freestream in ic.json, which is what makes
+            # runs sharing a physics group into ONE system with several ICs.  Folding
+            # the freestream into a branch's params.json would split that system per
+            # freestream and destroy the demonstration regime, so only do it for
+            # old-schema sources, which grouped on the combined record.
+            src_has_ic = os.path.exists(os.path.join(rd, "ic.json"))
+
             for ci, target_physics in enumerate(targets):
                 is_self = (ci == 0)
-                branch_params = {**target_physics, **freestream, **meta}
+                branch_params = ({**target_physics, **meta} if src_has_ic
+                                 else {**target_physics, **freestream, **meta})
                 for bi, frame_path in enumerate(branch_frames_paths):
                     total_solves += 1
                     total_branches += 1
@@ -333,6 +364,11 @@ def main():
                     os.makedirs(save_dir, exist_ok=True)
                     with open(os.path.join(save_dir, "params.json"), "w") as f:
                         json.dump(branch_params, f, indent=2)
+                    # New-schema layout: the freestream lives beside params.json so the
+                    # branch is a fresh IC of the target-physics system, not its own.
+                    if src_has_ic and freestream:
+                        with open(os.path.join(save_dir, "ic.json"), "w") as f:
+                            json.dump(freestream, f, indent=2)
                     with open(os.path.join(save_dir, "branch_meta.json"), "w") as f:
                         json.dump({
                             "source_run": os.path.basename(rd),
