@@ -85,6 +85,14 @@ import run_gen as rg   # reuse the solver plumbing (_import_solver, apply_overri
 # mesh.  Anything not freestream/meta is treated as physics.
 FREESTREAM_KEYS = ("rho_inf", "T_inf", "v_n_inf", "v_t_inf", "aoa_deg")
 GEOM_META_KEYS  = ("problem", "mesh_uid", "n_colliders")
+# Provenance/bookkeeping written by newer generators.  These are NOT solver physics —
+# passing them to the config raises AttributeError — and a branch must not inherit
+# them either: `context_id` labels the SOURCE run's system, but a branch is evolved
+# under different physics and so belongs to a different one.
+BOOKKEEPING_KEYS = ("context_id",)
+
+# Unknown-config-key names already reported, so the warning prints once per key.
+_WARNED_UNKNOWN_KEYS: set[str] = set()
 
 
 def split_params(params: dict) -> tuple[dict, dict, dict]:
@@ -92,7 +100,8 @@ def split_params(params: dict) -> tuple[dict, dict, dict]:
     freestream = {k: params[k] for k in FREESTREAM_KEYS if k in params}
     meta       = {k: params[k] for k in GEOM_META_KEYS if k in params}
     physics    = {k: v for k, v in params.items()
-                  if k not in FREESTREAM_KEYS and k not in GEOM_META_KEYS}
+                  if k not in FREESTREAM_KEYS and k not in GEOM_META_KEYS
+                  and k not in BOOKKEEPING_KEYS}
     return physics, freestream, meta
 
 
@@ -170,6 +179,19 @@ def run_one_branch(mesh_dict, problem, physics, freestream, frame_path,
     bound_edgs = mesh_dict["bound_edgs"]
 
     cfg = rg._make_base_cfg(problem)
+
+    # Defensive: params.json schemas drift between generator versions (newer ones add
+    # fields the solver config has never heard of).  apply_overrides sets attributes
+    # directly, so a single unknown key raises AttributeError and kills EVERY branch.
+    # Keep only real config fields, and say once which keys were dropped.
+    unknown = sorted(k for k in physics if not hasattr(cfg, k))
+    if unknown:
+        new = [k for k in unknown if k not in _WARNED_UNKNOWN_KEYS]
+        if new:
+            print(f"    [warn] params.json key(s) not on the solver config, ignoring: {new}")
+            _WARNED_UNKNOWN_KEYS.update(new)
+        physics = {k: v for k, v in physics.items() if k not in unknown}
+
     overrides = {
         **physics, **freestream,
         "plot": False, "exact_interval": True, "compile": compile_step,
