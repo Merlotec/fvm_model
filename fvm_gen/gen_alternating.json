@@ -1,45 +1,96 @@
 {
-  "_comment": "Alternating-context rollouts. Each trajectory is ONE continuous physical rollout during which the hidden physics context AND the frame interval save_t are resampled every segment. A segment is steps_per_segment saved frames at its own save_t ~ save_t_spec, so sim-duration = steps_per_segment * save_t. save_t is written to each segment's params.json (the frame spacing changes what one transition means, so it is part of the system definition). Every context segment is saved to its own run dir (frames restart at t=0), so a trajectory yields a chain of standard dataset dirs. Fields (Vx,Vy,rho,T) are continuous across switches — only the dynamics (and frame rate) change — so the switch must be inferred from transitions, never from a single frame. The freestream/IC draw is fixed per trajectory (a switching BC would leak the context switch); chain lineage lives in ic.json (traj_id/segment_id/t_offset), which grouping ignores.",
-
-  "problem": ["ellipse", "nozzle"],
+  "_comment": "Alternating-context rollouts. Each trajectory is ONE continuous physical rollout during which the hidden physics context AND the frame interval save_t are resampled every segment. A segment is steps_per_segment saved frames at its own save_t ~ save_t_spec, so sim-duration = steps_per_segment * save_t. save_t is written to each segment's params.json (the frame spacing changes what one transition means, so it is part of the system definition). Every context segment is saved to its own run dir (frames restart at t=0), so a trajectory yields a chain of standard dataset dirs. Fields (Vx,Vy,rho,T) are continuous across switches \u2014 only the dynamics (and frame rate) change \u2014 so the switch must be inferred from transitions, never from a single frame. The freestream/IC draw is fixed per trajectory (a switching BC would leak the context switch); chain lineage lives in ic.json (traj_id/segment_id/t_offset), which grouping ignores.",
+  "problem": "ellipse",
   "n_meshes": 8,
   "trajs_per_mesh": 16,
   "n_segments": 4,
   "seed": 42,
-
   "steps_per_segment": 30,
-  "save_t_spec": {"dist": "uniform", "low": 0.01, "high": 0.2},
-
+  "save_t_spec": {
+    "dist": "uniform",
+    "low": 0.01,
+    "high": 0.2
+  },
   "n_iter": 200000,
   "print_i": 500,
   "compile": true,
-
   "output_subdir": "fvm_gen_alternating",
-
   "min_colliders": 1,
   "max_colliders": 4,
-
-  "_context_note": "Hidden physics, resampled per segment — the alternating context.",
+  "_context_note": "Hidden physics, resampled per segment \u2014 the alternating context.",
   "context_param_specs": {
-    "visc_model":       {"choices": ["Newtonian", "PowerLaw", "Carreau", "HerschelBulkley"]},
-    "visc_n":           {"dist": "uniform",   "low": 0.3,  "high": 1.8},
-    "visc_min_factor":  {"dist": "uniform",   "low": 0.1,  "high": 0.6},
-    "visc_gamma_scale": {"dist": "loguniform","low": 2.0,  "high": 40.0},
-
-    "viscosity":        {"dist": "loguniform","low": 3e-4, "high": 6e-2},
-    "visc_bulk":        {"dist": "loguniform","low": 1e-3, "high": 3e-1},
-    "thermal_cond":     {"dist": "loguniform","low": 5e-7, "high": 5e-3},
-    "C_v":              {"dist": "uniform",   "low": 1.5,  "high": 3.0},
-    "gamma":            {"dist": "uniform",   "low": 1.1,  "high": 1.67}
+    "visc_model": {
+      "choices": [
+        "Newtonian",
+        "PowerLaw",
+        "Carreau",
+        "HerschelBulkley"
+      ]
+    },
+    "visc_n": {
+      "dist": "uniform",
+      "low": 0.3,
+      "high": 1.8
+    },
+    "visc_min_factor": {
+      "dist": "uniform",
+      "low": 0.1,
+      "high": 0.6
+    },
+    "visc_gamma_scale": {
+      "dist": "loguniform",
+      "low": 2.0,
+      "high": 40.0
+    },
+    "viscosity": {
+      "dist": "loguniform",
+      "low": 0.0003,
+      "high": 0.06
+    },
+    "visc_bulk": {
+      "dist": "loguniform",
+      "low": 0.001,
+      "high": 0.3
+    },
+    "thermal_cond": {
+      "dist": "loguniform",
+      "low": 5e-07,
+      "high": 0.005
+    },
+    "C_v": {
+      "dist": "uniform",
+      "low": 1.5,
+      "high": 3.0
+    },
+    "gamma": {
+      "dist": "uniform",
+      "low": 1.1,
+      "high": 1.67
+    }
   },
-
   "_ic_note": "Freestream/BC, sampled once per trajectory and held fixed across all its segments.",
   "ic_param_specs": {
-    "rho_inf":          {"dist": "uniform",   "low": 0.5,  "high": 2.0},
-    "T_inf":            {"dist": "uniform",   "low": 80.0, "high": 140.0},
-    "v_n_inf":          {"dist": "uniform",   "low": 2.0,  "high": 7.0},
-    "aoa_deg":          {"dist": "uniform",   "low": 0.0,  "high": 360.0}
+    "rho_inf": {
+      "dist": "uniform",
+      "low": 0.5,
+      "high": 2.0
+    },
+    "T_inf": {
+      "dist": "uniform",
+      "low": 80.0,
+      "high": 140.0
+    },
+    "v_n_inf": {
+      "dist": "uniform",
+      "low": 2.0,
+      "high": 7.0
+    },
+    "aoa_deg": {
+      "dist": "uniform",
+      "low": 0.0,
+      "high": 360.0
+    }
   },
-
-  "phys_overrides": {}
+  "phys_overrides": {},
+  "_nozzle_note": "nozzle removed: its geometry is two OPEN wall polylines, which the gmsh-based create_mesh (closed curve loops) cannot mesh \u2014 every nozzle draw fails deterministically on all platforms and only wastes retries. Re-add once create_mesh supports open chains (e.g. gmsh OCC fragment)."
 }

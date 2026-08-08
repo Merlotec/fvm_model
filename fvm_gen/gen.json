@@ -1,43 +1,91 @@
 {
   "_comment": "In-context grid generation. Per mesh we run the full n_context x n_ic grid: n_context hidden-physics draws (each a SYSTEM to infer) x n_ic shared freestream/IC draws. A column (fixed physics, varying IC) is one multi-IC system for the demonstration regime; a row (fixed IC, varying physics) is the SAME starting frame under many contexts, which forces the model to actually use the context instead of memorising frame appearance. context_param_specs -> params.json (the system, and what is inferred); ic_param_specs -> ic.json (shared across contexts). Leave both empty to fall back to legacy per-run param_specs sampling.",
-
-  "problem": ["ellipse", "nozzle"],
+  "problem": "ellipse",
   "n_meshes": 12,
   "n_context": 12,
   "n_ic": 6,
   "seed": 42,
-
   "save_t": 0.01,
   "n_iter": 12000,
   "print_i": 500,
   "compile": true,
-
   "output_subdir": "fvm_gen_incontext",
-
   "min_colliders": 1,
   "max_colliders": 4,
-
-  "_context_note": "Hidden physics — NOT visible in a single frame, so the model must infer them from transitions. These define the system and go in params.json. C_v lives here (constant per system) because the data loader reads it from params.json to convert primitives->conserved; it mildly affects the initial energy channel, so move it to ic_param_specs for a perfectly-shared conserved start frame at the cost of not inferring it.",
+  "_context_note": "Hidden physics \u2014 NOT visible in a single frame, so the model must infer them from transitions. These define the system and go in params.json. C_v lives here (constant per system) because the data loader reads it from params.json to convert primitives->conserved; it mildly affects the initial energy channel, so move it to ic_param_specs for a perfectly-shared conserved start frame at the cost of not inferring it.",
   "context_param_specs": {
-    "visc_model":       {"choices": ["Newtonian", "PowerLaw", "Carreau", "HerschelBulkley"]},
-    "visc_n":           {"dist": "uniform",   "low": 0.3,  "high": 1.8},
-    "visc_min_factor":  {"dist": "uniform",   "low": 0.1,  "high": 0.6},
-    "visc_gamma_scale": {"dist": "loguniform","low": 2.0,  "high": 40.0},
-
-    "viscosity":        {"dist": "loguniform","low": 3e-4, "high": 6e-2},
-    "visc_bulk":        {"dist": "loguniform","low": 1e-3, "high": 3e-1},
-    "thermal_cond":     {"dist": "loguniform","low": 5e-7, "high": 5e-3},
-    "C_v":              {"dist": "uniform",   "low": 1.5,  "high": 3.0},
-    "gamma":            {"dist": "uniform",   "low": 1.1,  "high": 1.67}
+    "visc_model": {
+      "choices": [
+        "Newtonian",
+        "PowerLaw",
+        "Carreau",
+        "HerschelBulkley"
+      ]
+    },
+    "visc_n": {
+      "dist": "uniform",
+      "low": 0.3,
+      "high": 1.8
+    },
+    "visc_min_factor": {
+      "dist": "uniform",
+      "low": 0.1,
+      "high": 0.6
+    },
+    "visc_gamma_scale": {
+      "dist": "loguniform",
+      "low": 2.0,
+      "high": 40.0
+    },
+    "viscosity": {
+      "dist": "loguniform",
+      "low": 0.0003,
+      "high": 0.06
+    },
+    "visc_bulk": {
+      "dist": "loguniform",
+      "low": 0.001,
+      "high": 0.3
+    },
+    "thermal_cond": {
+      "dist": "loguniform",
+      "low": 5e-07,
+      "high": 0.005
+    },
+    "C_v": {
+      "dist": "uniform",
+      "low": 1.5,
+      "high": 3.0
+    },
+    "gamma": {
+      "dist": "uniform",
+      "low": 1.1,
+      "high": 1.67
+    }
   },
-
   "_ic_note": "Freestream / boundary conditions that DEFINE the initial condition (and are largely visible in the frame). Shared across all contexts within a mesh, so the same starting frames recur under every physics draw.",
   "ic_param_specs": {
-    "rho_inf":          {"dist": "uniform",   "low": 0.5,  "high": 2.0},
-    "T_inf":            {"dist": "uniform",   "low": 80.0, "high": 140.0},
-    "v_n_inf":          {"dist": "uniform",   "low": 2.0,  "high": 7.0},
-    "aoa_deg":          {"dist": "uniform",   "low": 0.0,  "high": 360.0}
+    "rho_inf": {
+      "dist": "uniform",
+      "low": 0.5,
+      "high": 2.0
+    },
+    "T_inf": {
+      "dist": "uniform",
+      "low": 80.0,
+      "high": 140.0
+    },
+    "v_n_inf": {
+      "dist": "uniform",
+      "low": 2.0,
+      "high": 7.0
+    },
+    "aoa_deg": {
+      "dist": "uniform",
+      "low": 0.0,
+      "high": 360.0
+    }
   },
-
-  "phys_overrides": {}
+  "phys_overrides": {},
+  "_nozzle_note": "nozzle removed: its geometry is two OPEN wall polylines, which the gmsh-based create_mesh (closed curve loops) cannot mesh \u2014 every nozzle draw fails deterministically on all platforms and only wastes retries. Re-add once create_mesh supports open chains (e.g. gmsh OCC fragment)."
 }
