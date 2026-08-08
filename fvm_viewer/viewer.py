@@ -431,13 +431,14 @@ def load_gen_frame(path: str) -> tuple[float, np.ndarray, bool]:
     return float(d["t"]), d["grid"].astype(np.float32), bool(d["is_seed"])
 
 
-def load_gen_shards(path: str) -> Optional[tuple[np.ndarray, np.ndarray]]:
-    """Optional latent shard cloud for a generated frame: (xy [M,2] pixel coords,
-    act [M] active(1)->shadow(0) gate), or None if the frame has no shard data."""
+def load_gen_refined(path: str) -> Optional[np.ndarray]:
+    """Optional flow-matching refiner output for a generated frame: grid (4,H,W),
+    or None if the frame carries no refined data (seed frames, or an inference run
+    without --refine)."""
     d = np.load(path)
-    if "shard_xy" not in d.files:
+    if "grid_refined" not in d.files:
         return None
-    return d["shard_xy"].astype(np.float32), d["shard_act"].astype(np.float32)
+    return d["grid_refined"].astype(np.float32)
 
 
 def closest_idx(files: list[str], target_t: float) -> int:
@@ -481,27 +482,16 @@ def make_field_figure(grid: np.ndarray, title: str,
     return fig
 
 
-def make_shard_figure(shards: Optional[tuple[np.ndarray, np.ndarray]],
-                      H: int, W: int, title: str) -> go.Figure:
-    """Latent shard point cloud on the SAME pixel axes as the field heatmaps.
-    Colour runs blue (active, gate=1) -> red (shadow, gate=0)."""
+def make_empty_figure(H: int, W: int, title: str) -> go.Figure:
+    """Placeholder on the same pixel axes as the field heatmaps, for frames with
+    no refiner output (seed frames, or a run produced without --refine)."""
     fig = go.Figure()
-    if shards is not None and len(shards[0]):
-        xy, act = shards
-        fig.add_trace(go.Scattergl(
-            x=xy[:, 0], y=xy[:, 1], mode="markers",
-            marker=dict(size=6, color=act, colorscale=[[0.0, "red"], [1.0, "blue"]],
-                        cmin=0.0, cmax=1.0, showscale=True, line=dict(width=0),
-                        colorbar=dict(thickness=10, len=0.85, title="active")),
-            hovertemplate="x=%{x:.1f} y=%{y:.1f}<br>active=%{marker.color:.2f}<extra></extra>",
-        ))
-    # share the heatmap's frame: x in [0,W], y reversed in [0,H], square aspect
     fig.update_layout(
         title=dict(text=title, font=dict(size=12), x=0.5, xanchor="center"),
         xaxis=dict(visible=False, range=[0, W], scaleanchor="y", constrain="domain"),
         yaxis=dict(visible=False, range=[H, 0]),
         margin=dict(l=0, r=0, t=36, b=0), height=280,
-        plot_bgcolor="#f7f7f7", uirevision="shards",
+        plot_bgcolor="#f7f7f7", uirevision="refined",
     )
     return fig
 
@@ -932,9 +922,10 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
             *[dcc.Graph(id=f"plot-bot-{i}", config=_GRAPH_CFG) for i in range(4)],
             *[dcc.Graph(id=f"plot-scale-{i}", config=_GRAPH_CFG,
                         style={"height": "52px"}) for i in range(4)],
-            html.Div(id="row-label-shards",
-                     children="Shards (blue = active, red = shadow)", style=_ROW_LABEL_STYLE),
-            dcc.Graph(id="plot-shards", config=_GRAPH_CFG, style={"gridColumn": "span 2"}),
+            html.Div(id="row-label-refined",
+                     children="Detail model (flow matching) output",
+                     style=_ROW_LABEL_STYLE),
+            *[dcc.Graph(id=f"plot-refined-{i}", config=_GRAPH_CFG) for i in range(4)],
         ],
         style={"display": "grid", "gridTemplateColumns": "1fr 1fr 1fr 1fr",
                "gap": "4px", "padding": "4px"},
@@ -1015,9 +1006,11 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
         Output("plot-scale-2", "figure"), Output("plot-scale-3", "figure"),
         Output("plot-bot-0", "figure"), Output("plot-bot-1", "figure"),
         Output("plot-bot-2", "figure"), Output("plot-bot-3", "figure"),
-        Output("plot-shards", "figure"),
+        Output("plot-refined-0", "figure"), Output("plot-refined-1", "figure"),
+        Output("plot-refined-2", "figure"), Output("plot-refined-3", "figure"),
         Output("row-label-top", "children"),
         Output("row-label-bot", "children"),
+        Output("row-label-refined", "children"),
         Output("header-info", "children"),
         Output("step-slider", "max"), Output("step-slider", "value"),
         Input("state", "data"),
@@ -1034,8 +1027,7 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
 
         gen_t, gen_grid, is_seed = load_gen_frame(gen_files[step_idx])
         gen_H, gen_W = gen_grid.shape[1], gen_grid.shape[2]
-        shard_fig = make_shard_figure(load_gen_shards(gen_files[step_idx]),
-                                      gen_H, gen_W, "shards  " + ("seed" if is_seed else "pred"))
+        refined_grid = load_gen_refined(gen_files[step_idx])
         real_idx  = closest_idx(real_files, gen_t)
         real_t, cell_prims = load_step(real_files[real_idx])
         real_grid = renderers[real_dir].render_cell_smooth(cell_prims).numpy()
@@ -1079,8 +1071,28 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
             top_label = "Real"
             bot_label = "Generated"
 
-        return (*top_figs, *scale_figs, *bot_figs, shard_fig,
-                top_label, bot_label, header, n - 1, step_idx)
+        # Detail-model row: the increment the flow-matching refiner adds on top of
+        # the base prediction (refined - generated).  This is the refiner's actual
+        # output; the refined field itself is nearly identical to the generated one,
+        # so plotting it absolutely would just duplicate the row above.
+        if refined_grid is not None:
+            detail = refined_grid - gen_grid
+            det_maxabs = [float(np.abs(detail[i]).max()) or 1.0 for i in range(4)]
+            refined_figs = [
+                make_delta_figure(detail[i], f"detail {FIELD_NAMES[i]}", det_maxabs[i])
+                for i in range(4)
+            ]
+            rms = float(np.sqrt(np.mean(detail ** 2)))
+            refined_label = (f"Detail model (flow matching) output   "
+                             f"refined - generated,  RMS = {rms:.4g}")
+        else:
+            why = "seed frame" if is_seed else "run has no refiner output (use infer.py --refine)"
+            refined_figs = [make_empty_figure(gen_H, gen_W, f"detail {FIELD_NAMES[i]}")
+                            for i in range(4)]
+            refined_label = f"Detail model (flow matching) output   [{why}]"
+
+        return (*top_figs, *scale_figs, *bot_figs, *refined_figs,
+                top_label, bot_label, refined_label, header, n - 1, step_idx)
 
     @app.callback(
         Output("video-download", "data"),
