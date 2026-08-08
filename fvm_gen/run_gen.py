@@ -71,6 +71,19 @@ def _import_solver():
     from time_fvm.mesh_utils.fvm_mesh import FVMMesh2D
     from run_fvm import generate_mesh, init_conds_ellipses, init_conds_nozzle
 
+    # Physics constants are tensors (see FluidConstitution._scal), so parameter draws
+    # reuse one compiled graph — but each (viscosity model, mesh shape) combo still
+    # legitimately recompiles.  The default limit (8 per frame) then silently drops
+    # the solver to eager mid-sweep; raise it so a long sweep keeps compiled speed.
+    try:
+        import torch._dynamo
+        for attr in ("cache_size_limit", "recompile_limit"):
+            if hasattr(torch._dynamo.config, attr):
+                setattr(torch._dynamo.config, attr,
+                        max(64, getattr(torch._dynamo.config, attr)))
+    except Exception:
+        pass
+
     _S.update(ConfigEllipse=ConfigEllipse, ConfigNozzle=ConfigNozzle,
               ViscosityModel=ViscosityModel, FVMEquation=FVMEquation,
               FluidConstitution2D=FluidConstitution2D, FVMMesh2D=FVMMesh2D,
