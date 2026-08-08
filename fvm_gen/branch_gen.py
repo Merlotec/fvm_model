@@ -265,8 +265,17 @@ def main():
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the solver step (off by default — branches are "
                         "short, so compile overhead dominates)")
+    p.add_argument("--order", choices=("interleave", "shuffle", "mesh"),
+                   default="interleave",
+                   help="job ordering across meshes.  'interleave' (default) "
+                        "round-robins so every mesh gains branches at the same "
+                        "rate and an interrupted sweep is still balanced; "
+                        "'shuffle' is fully random; 'mesh' is the old "
+                        "one-mesh-at-a-time behaviour")
+    p.add_argument("--limit", type=int, default=None,
+                   help="stop after this many branch solves (time-boxed sweeps)")
     p.add_argument("--dry-run", action="store_true",
-                   help="print the plan (solve count) without running the solver")
+                   help="print the plan (solve count per mesh) without solving")
     args = p.parse_args()
 
     root = os.path.abspath(args.data)
@@ -279,11 +288,17 @@ def main():
     if not args.dry_run:
         rg._import_solver()            # populates rg._S and injects solver paths
 
-    total_solves = total_branches = 0
     print(f"Branching: {len(mesh_dirs)} mesh(es) | branch_points={args.branch_points} "
           f"contexts={args.contexts} branch_frames={args.branch_frames} "
-          f"device={device} dry_run={args.dry_run}\n")
+          f"device={device} order={args.order} dry_run={args.dry_run}\n")
 
+    # ------------------------------------------------------------------
+    # PLAN.  Enumerate every branch job first, WITHOUT touching the solver or
+    # loading any mesh pickle.  Planning is cheap (params.json + a directory
+    # listing per run), and doing it up front is what lets the jobs be ordered
+    # across meshes rather than draining one mesh at a time.
+    # ------------------------------------------------------------------
+    jobs_by_mesh: "dict[str, list[dict]]" = {}
     for mesh_dir in mesh_dirs:
         runs = base_run_dirs(mesh_dir)
         if not runs:
@@ -297,21 +312,12 @@ def main():
             run_params[rd] = pj
             physics_palette.append(split_params(pj)[0])
 
-        mesh_dict = None
-        if not args.dry_run:
-            with open(os.path.join(mesh_dir, "shared_mesh.pkl"), "rb") as f:
-                mesh_dict = pickle.load(f)
-            # branches must run on the device the mesh tensors live on
-            device = str(mesh_dict["mesh"].vertices.device)
-
         src_runs = runs
         if args.source_runs is not None and args.source_runs < len(runs):
             idx = rng.choice(len(runs), args.source_runs, replace=False)
             src_runs = [runs[i] for i in sorted(idx)]
 
-        print(f"[{os.path.basename(mesh_dir)}] {len(src_runs)} source run(s), "
-              f"physics palette size {len(physics_palette)}")
-
+        mesh_jobs: "list[dict]" = []
         for rd in src_runs:
             src_params = run_params[rd]
             src_physics, freestream, meta = split_params(src_params)
@@ -346,52 +352,127 @@ def main():
             src_has_ic = os.path.exists(os.path.join(rd, "ic.json"))
 
             for ci, target_physics in enumerate(targets):
-                is_self = (ci == 0)
                 branch_params = ({**target_physics, **meta} if src_has_ic
                                  else {**target_physics, **freestream, **meta})
                 for bi, frame_path in enumerate(branch_frames_paths):
-                    total_solves += 1
-                    total_branches += 1
-                    src_tag = os.path.basename(rd).replace("run_", "")[:8]
-                    uid = secrets.token_hex(3)
-                    run_name = f"run_br_{src_tag}_c{ci}_b{bi}_{uid}"
-                    save_dir = os.path.join(mesh_dir, run_name)
-                    src_frame_t = float(os.path.basename(frame_path)[2:-4])
+                    mesh_jobs.append(dict(
+                        mesh_dir=mesh_dir, rd=rd, problem=problem,
+                        src_physics=src_physics, target_physics=target_physics,
+                        freestream=freestream, branch_params=branch_params,
+                        frame_path=frame_path, save_t=save_t,
+                        ci=ci, bi=bi, is_self=(ci == 0), src_has_ic=src_has_ic,
+                    ))
+        if mesh_jobs:
+            jobs_by_mesh[mesh_dir] = mesh_jobs
+            print(f"[{os.path.basename(mesh_dir)}] {len(set(j['rd'] for j in mesh_jobs))} "
+                  f"source run(s) -> {len(mesh_jobs)} branch job(s)")
 
-                    if args.dry_run:
-                        continue
+    if not jobs_by_mesh:
+        raise SystemExit("No branch jobs planned — check --data and --first-frame.")
 
-                    os.makedirs(save_dir, exist_ok=True)
-                    with open(os.path.join(save_dir, "params.json"), "w") as f:
-                        json.dump(branch_params, f, indent=2)
-                    # New-schema layout: the freestream lives beside params.json so the
-                    # branch is a fresh IC of the target-physics system, not its own.
-                    if src_has_ic and freestream:
-                        with open(os.path.join(save_dir, "ic.json"), "w") as f:
-                            json.dump(freestream, f, indent=2)
-                    with open(os.path.join(save_dir, "branch_meta.json"), "w") as f:
-                        json.dump({
-                            "source_run": os.path.basename(rd),
-                            "source_frame_t": src_frame_t,
-                            "source_physics": src_physics,
-                            "target_physics": target_physics,
-                            "freestream": freestream,
-                            "is_self_physics": is_self,
-                        }, f, indent=2)
-                    try:
-                        run_one_branch(mesh_dict, problem, target_physics,
-                                       freestream, frame_path, save_dir, save_t,
-                                       args.branch_frames, device, args.compile)
-                    except Exception as e:      # one bad branch must not kill the sweep
-                        print(f"    !! branch failed ({type(e).__name__}: {e}) — "
-                              f"removing {run_name}")
-                        import shutil
-                        shutil.rmtree(save_dir, ignore_errors=True)
-                        total_branches -= 1
+    # ------------------------------------------------------------------
+    # ORDER.  The generator used to run every job for mesh 1, then mesh 2, ...
+    # Each job is a full solver run, so a sweep that is interrupted (or simply
+    # slower than expected) produced branches for the first mesh ONLY, leaving
+    # the rest of the geometries with none.  Interleaving round-robin means the
+    # branches are spread evenly over meshes at every point in time, so stopping
+    # early still yields a balanced dataset.
+    # ------------------------------------------------------------------
+    for mj in jobs_by_mesh.values():
+        rng.shuffle(mj)                                  # random within a mesh
 
-    print(f"\nPlanned {total_solves} branch solve(s)."
-          if args.dry_run else
-          f"\nDone. Wrote {total_branches} branch trajectories.")
+    order = args.order
+    if order == "mesh":
+        jobs = [j for mj in jobs_by_mesh.values() for j in mj]
+    elif order == "shuffle":
+        jobs = [j for mj in jobs_by_mesh.values() for j in mj]
+        rng.shuffle(jobs)
+    else:                                                # "interleave" (default)
+        buckets = list(jobs_by_mesh.values())
+        rng.shuffle(buckets)                             # no fixed mesh precedence
+        jobs = []
+        for i in range(max(len(b) for b in buckets)):
+            for b in buckets:
+                if i < len(b):
+                    jobs.append(b[i])
+
+    if args.limit is not None and args.limit < len(jobs):
+        jobs = jobs[:args.limit]
+        print(f"\n--limit {args.limit}: truncating to the first {len(jobs)} job(s)")
+
+    n_mesh = len(jobs_by_mesh)
+    print(f"\nPlanned {len(jobs)} branch job(s) over {n_mesh} mesh(es) "
+          f"in '{order}' order.")
+    if args.dry_run:
+        per = {}
+        for j in jobs:
+            per[os.path.basename(j["mesh_dir"])] = per.get(
+                os.path.basename(j["mesh_dir"]), 0) + 1
+        for k in sorted(per):
+            print(f"    {k:<28}{per[k]:>6}")
+        print(f"\nPlanned {len(jobs)} branch solve(s).")
+        return
+
+    # ------------------------------------------------------------------
+    # EXECUTE.  Mesh pickles are cached, so interleaving costs nothing beyond
+    # the first load of each mesh (the solver is rebuilt per branch regardless).
+    # ------------------------------------------------------------------
+    mesh_cache: "dict[str, tuple]" = {}
+
+    def get_mesh(mesh_dir):
+        if mesh_dir not in mesh_cache:
+            with open(os.path.join(mesh_dir, "shared_mesh.pkl"), "rb") as f:
+                md = pickle.load(f)
+            # branches must run on the device the mesh tensors live on
+            mesh_cache[mesh_dir] = (md, str(md["mesh"].vertices.device))
+        return mesh_cache[mesh_dir]
+
+    total_branches = 0
+    done_per_mesh: "dict[str, int]" = {}
+    for n, j in enumerate(jobs, 1):
+        mesh_dir = j["mesh_dir"]
+        mesh_dict, dev = get_mesh(mesh_dir)
+        mesh_name = os.path.basename(mesh_dir)
+        src_tag = os.path.basename(j["rd"]).replace("run_", "")[:8]
+        uid = secrets.token_hex(3)
+        run_name = f"run_br_{src_tag}_c{j['ci']}_b{j['bi']}_{uid}"
+        save_dir = os.path.join(mesh_dir, run_name)
+        src_frame_t = float(os.path.basename(j["frame_path"])[2:-4])
+
+        print(f"[{n}/{len(jobs)}] {mesh_name} {run_name}")
+        os.makedirs(save_dir, exist_ok=True)
+        with open(os.path.join(save_dir, "params.json"), "w") as f:
+            json.dump(j["branch_params"], f, indent=2)
+        # New-schema layout: the freestream lives beside params.json so the
+        # branch is a fresh IC of the target-physics system, not its own.
+        if j["src_has_ic"] and j["freestream"]:
+            with open(os.path.join(save_dir, "ic.json"), "w") as f:
+                json.dump(j["freestream"], f, indent=2)
+        with open(os.path.join(save_dir, "branch_meta.json"), "w") as f:
+            json.dump({
+                "source_run": os.path.basename(j["rd"]),
+                "source_frame_t": src_frame_t,
+                "source_physics": j["src_physics"],
+                "target_physics": j["target_physics"],
+                "freestream": j["freestream"],
+                "is_self_physics": j["is_self"],
+            }, f, indent=2)
+        try:
+            run_one_branch(mesh_dict, j["problem"], j["target_physics"],
+                           j["freestream"], j["frame_path"], save_dir,
+                           j["save_t"], args.branch_frames, dev, args.compile)
+            total_branches += 1
+            done_per_mesh[mesh_name] = done_per_mesh.get(mesh_name, 0) + 1
+        except Exception as e:      # one bad branch must not kill the sweep
+            print(f"    !! branch failed ({type(e).__name__}: {e}) — "
+                  f"removing {run_name}")
+            import shutil
+            shutil.rmtree(save_dir, ignore_errors=True)
+
+    print(f"\nDone. Wrote {total_branches} branch trajectories "
+          f"over {len(done_per_mesh)} mesh(es):")
+    for k in sorted(done_per_mesh):
+        print(f"    {k:<28}{done_per_mesh[k]:>6}")
 
 
 if __name__ == "__main__":
