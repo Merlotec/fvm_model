@@ -3,10 +3,14 @@ Alternating-context rollout generator for the FVM solver.
 
 One trajectory = one continuous physical rollout on one mesh, during which the hidden
 physics context (viscosity model/params, thermal conductivity, gamma, ...) is RESAMPLED
-every T seconds, T ~ U(switch_t_min, switch_t_max).  Each context segment is written to
-its own run directory (params.json = that segment's context, frames restart at t=0), so
-one trajectory produces a CHAIN of dataset directories, each fully compatible with the
-existing mesh_<uid>/run_*/ structure — viewers and loaders need no changes.
+every segment.  A segment is steps_per_segment SAVED FRAMES long (default 30), at a
+per-segment frame interval save_t drawn from save_t_spec (default U(0.01, 0.2)) — so
+segment sim-duration is steps_per_segment * save_t and both the context AND the frame
+rate alternate.  save_t is recorded in each segment's params.json.  Each context segment
+is written to its own run directory (params.json = that segment's context, frames
+restart at t=0), so one trajectory produces a CHAIN of dataset directories, each fully
+compatible with the existing mesh_<uid>/run_*/ structure — viewers and loaders need no
+changes.
 
 Continuity across a switch is enforced in PRIMITIVES (Vx, Vy, rho, T): the fields the
 model observes carry no visible seam, only the dynamics change.  (Conserved energy may
@@ -52,14 +56,17 @@ class AltConfig:
     n_segments: int = 4               # context switches per trajectory (segments in the chain)
     seed: int = 42
 
-    # Segment duration T ~ U(switch_t_min, switch_t_max), snapped to a multiple of
-    # save_t so exact_interval lands the final frame exactly on the switch time.
-    switch_t_min: float = 1.0
-    switch_t_max: float = 2.0
+    # A segment is steps_per_segment saved frames at a per-segment save_t drawn from
+    # save_t_spec — the frame rate alternates along with the context, and the segment's
+    # sim-duration is steps_per_segment * save_t (end_t lands exactly on the last frame
+    # since it is a multiple of save_t by construction).
+    steps_per_segment: int = 30
+    save_t_spec: dict = field(default_factory=lambda: {
+        "dist": "uniform", "low": 0.01, "high": 0.2})
 
     # Solver run controls (applied to every segment).
-    save_t: float = 0.01              # sim-time between saved frames
-    n_iter: int = 50000               # per-segment iteration safety cap (stop is end_t)
+    n_iter: int = 200000              # per-segment iteration safety cap (stop is end_t;
+                                      # 30 steps at save_t=0.2 is ~6 s sim time)
     print_i: int = 500
     compile: bool = True
 
@@ -79,12 +86,6 @@ class AltConfig:
     phys_overrides: dict[str, Any] = field(default_factory=dict)
 
     output_subdir: str = "fvm_gen_alternating"
-
-
-def _snap_duration(T: float, save_t: float) -> float:
-    """Snap a sampled duration to a positive multiple of save_t, so the solver's
-    exact_interval stepping lands the last saved frame exactly on the switch time."""
-    return max(1, round(T / save_t)) * save_t
 
 
 def _handoff_state(prims: torch.Tensor, phy) -> torch.Tensor:
@@ -121,6 +122,8 @@ def run_alternating(gen: AltConfig, dry_run: bool = False, out_dir: Optional[str
     if gen.n_segments < 2:
         raise SystemExit(f"n_segments={gen.n_segments}: an alternating trajectory needs "
                          f"at least 2 segments (one switch).")
+    if gen.steps_per_segment < 1:
+        raise SystemExit(f"steps_per_segment={gen.steps_per_segment}: must be >= 1.")
 
     rng = np.random.default_rng(gen.seed)
     out_root = os.path.abspath(out_dir) if out_dir else os.path.join(
@@ -144,7 +147,8 @@ def run_alternating(gen: AltConfig, dry_run: bool = False, out_dir: Optional[str
     manifest = {"problems": problems, "mode": "alternating",
                 "n_meshes": gen.n_meshes, "trajs_per_mesh": gen.trajs_per_mesh,
                 "n_segments": gen.n_segments,
-                "switch_t": [gen.switch_t_min, gen.switch_t_max], "runs": []}
+                "steps_per_segment": gen.steps_per_segment,
+                "save_t_spec": gen.save_t_spec, "runs": []}
 
     for m in range(gen.n_meshes):
         mesh_uid = secrets.token_hex(4)
@@ -191,53 +195,59 @@ def run_alternating(gen: AltConfig, dry_run: bool = False, out_dir: Optional[str
             traj_uid = secrets.token_hex(4)
             ic_params = RG._sample_specs(gen.ic_param_specs, rng)
             # Draw the whole chain up front so a dry run plans exactly what a real
-            # run executes.
+            # run executes.  Per segment: a context draw AND a frame-interval draw —
+            # segment duration is steps_per_segment * save_t, a multiple of save_t by
+            # construction, so exact_interval lands the last frame exactly on end_t.
             segments = []
             for seg in range(gen.n_segments):
                 ctx = RG._sample_specs(gen.context_param_specs, rng)
-                dur = _snap_duration(float(rng.uniform(gen.switch_t_min, gen.switch_t_max)),
-                                     gen.save_t)
-                segments.append((ctx, dur))
+                save_t = float(RG._sample_one("save_t", gen.save_t_spec, rng))
+                segments.append((ctx, save_t, gen.steps_per_segment * save_t))
 
             print(f"  [mesh {m + 1}/{gen.n_meshes} | traj {traj + 1}/{gen.trajs_per_mesh}] "
-                  f"({traj_uid}) durations: "
-                  + ", ".join(f"{d:.2f}s" for _, d in segments))
+                  f"({traj_uid}) save_t: "
+                  + ", ".join(f"{st:.3f}" for _, st, _ in segments)
+                  + "  durations: " + ", ".join(f"{d:.2f}s" for _, _, d in segments))
 
             prims_prev = None     # primitives carried across the context switch
             t_offset = 0.0
-            for seg, (ctx, dur) in enumerate(segments):
+            for seg, (ctx, save_t, dur) in enumerate(segments):
                 run_uid = secrets.token_hex(4)
                 run_dir = os.path.join(mesh_dir, f"run_a{traj:03d}_s{seg:02d}_{run_uid}")
                 os.makedirs(run_dir, exist_ok=True)
 
-                # params.json: context only (+ constants), same semantics as grid mode
-                # — it defines the system this segment belongs to.
-                record = {**ctx, "problem": problem, "mesh_uid": mesh_uid,
-                          "n_colliders": n_colliders}
+                # params.json: context (+ constants), same semantics as grid mode —
+                # it defines the system this segment belongs to.  save_t lives here
+                # because the frame spacing changes what one transition means: the
+                # same physics at a different save_t is a different prediction task.
+                record = {**ctx, "save_t": save_t, "problem": problem,
+                          "mesh_uid": mesh_uid, "n_colliders": n_colliders}
                 with open(os.path.join(run_dir, "params.json"), "w") as f:
                     json.dump(record, f, indent=2)
                 # ic.json: shared freestream + chain lineage (grouping ignores this).
                 with open(os.path.join(run_dir, "ic.json"), "w") as f:
                     json.dump({**ic_params, "traj_id": traj, "traj_uid": traj_uid,
                                "segment_id": seg, "t_offset": round(t_offset, 6),
-                               "duration": dur}, f, indent=2)
+                               "duration": round(dur, 6)}, f, indent=2)
 
                 manifest["runs"].append({"mesh": mesh_uid, "problem": problem,
                                          "run": run_uid, "n_colliders": n_colliders,
                                          "traj_uid": traj_uid, "traj_id": traj,
                                          "segment_id": seg, "t_offset": round(t_offset, 6),
-                                         "duration": dur, **ctx, **ic_params})
+                                         "save_t": save_t, "duration": round(dur, 6),
+                                         **ctx, **ic_params})
                 t_offset += dur
 
                 desc = ", ".join(f"{k}={v}" if isinstance(v, str) else f"{k}={v:.3g}"
                                  for k, v in ctx.items())
-                print(f"    [seg {seg + 1}/{gen.n_segments}] {dur:.2f}s  {desc}")
+                print(f"    [seg {seg + 1}/{gen.n_segments}] save_t={save_t:.3f} "
+                      f"({dur:.2f}s)  {desc}")
                 if dry_run:
                     continue
 
                 overrides = {**ctx, **ic_params, **gen.phys_overrides,
                              "plot": False, "exact_interval": True,
-                             "save_t": gen.save_t, "end_t": dur, "n_iter": gen.n_iter,
+                             "save_t": save_t, "end_t": dur, "n_iter": gen.n_iter,
                              "print_i": gen.print_i, "compile": gen.compile,
                              "save_dir": run_dir}
                 cfg = RG.apply_overrides(base_cfg, overrides)
@@ -259,10 +269,10 @@ def run_alternating(gen: AltConfig, dry_run: bool = False, out_dir: Optional[str
                           f"aborting trajectory {traj_uid}")
                     break
 
-                # Expected frame count: t=0 plus one per save_t up to end_t.  Fewer
+                # Expected frame count: t=0 plus steps_per_segment saves.  Fewer
                 # means the n_iter cap fired first; the chain timing would silently
                 # drift, so stop the trajectory rather than continue mid-segment.
-                n_expect = round(dur / gen.save_t) + 1
+                n_expect = gen.steps_per_segment + 1
                 n_have = len([f for f in os.listdir(run_dir)
                               if f.startswith("t_") and f.endswith(".npz")])
                 if n_have < n_expect:
@@ -288,8 +298,8 @@ def gen_from_file(path: str) -> AltConfig:
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description="Alternating-context FVM rollout generator: one continuous rollout, "
-                    "context resampled every T~U(switch_t_min, switch_t_max) seconds, "
-                    "one run dir per context segment.")
+                    "context + frame interval (save_t) resampled every segment of "
+                    "steps_per_segment saved frames, one run dir per context segment.")
     p.add_argument("config", help="path to a gen_alternating.json config")
     p.add_argument("--dry-run", action="store_true",
                    help="plan the chains + write params.json/ic.json/manifest without "

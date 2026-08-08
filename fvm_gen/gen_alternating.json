@@ -1,5 +1,5 @@
 {
-  "_comment": "Alternating-context rollouts. Each trajectory is ONE continuous physical rollout during which the hidden physics context is resampled every T ~ U(switch_t_min, switch_t_max) seconds. Every context segment is saved to its own run dir (params.json = that segment's context, frames restart at t=0), so a trajectory yields a chain of standard dataset dirs. Fields (Vx,Vy,rho,T) are continuous across switches — only the dynamics change — so the switch must be inferred from transitions, never from a single frame. The freestream/IC draw is fixed per trajectory (a switching BC would leak the context switch); chain lineage lives in ic.json (traj_id/segment_id/t_offset), which grouping ignores.",
+  "_comment": "Alternating-context rollouts. Each trajectory is ONE continuous physical rollout during which the hidden physics context AND the frame interval save_t are resampled every segment. A segment is steps_per_segment saved frames at its own save_t ~ save_t_spec, so sim-duration = steps_per_segment * save_t. save_t is written to each segment's params.json (the frame spacing changes what one transition means, so it is part of the system definition). Every context segment is saved to its own run dir (frames restart at t=0), so a trajectory yields a chain of standard dataset dirs. Fields (Vx,Vy,rho,T) are continuous across switches — only the dynamics (and frame rate) change — so the switch must be inferred from transitions, never from a single frame. The freestream/IC draw is fixed per trajectory (a switching BC would leak the context switch); chain lineage lives in ic.json (traj_id/segment_id/t_offset), which grouping ignores.",
 
   "problem": ["ellipse", "nozzle"],
   "n_meshes": 8,
@@ -7,11 +7,10 @@
   "n_segments": 4,
   "seed": 42,
 
-  "switch_t_min": 1.0,
-  "switch_t_max": 2.0,
+  "steps_per_segment": 30,
+  "save_t_spec": {"dist": "uniform", "low": 0.01, "high": 0.2},
 
-  "save_t": 0.01,
-  "n_iter": 50000,
+  "n_iter": 200000,
   "print_i": 500,
   "compile": true,
 
