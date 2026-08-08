@@ -1,0 +1,46 @@
+{
+  "_comment": "Alternating-context rollouts. Each trajectory is ONE continuous physical rollout during which the hidden physics context is resampled every T ~ U(switch_t_min, switch_t_max) seconds. Every context segment is saved to its own run dir (params.json = that segment's context, frames restart at t=0), so a trajectory yields a chain of standard dataset dirs. Fields (Vx,Vy,rho,T) are continuous across switches — only the dynamics change — so the switch must be inferred from transitions, never from a single frame. The freestream/IC draw is fixed per trajectory (a switching BC would leak the context switch); chain lineage lives in ic.json (traj_id/segment_id/t_offset), which grouping ignores.",
+
+  "problem": ["ellipse", "nozzle"],
+  "n_meshes": 8,
+  "trajs_per_mesh": 16,
+  "n_segments": 4,
+  "seed": 42,
+
+  "switch_t_min": 1.0,
+  "switch_t_max": 2.0,
+
+  "save_t": 0.01,
+  "n_iter": 50000,
+  "print_i": 500,
+  "compile": true,
+
+  "output_subdir": "fvm_gen_alternating",
+
+  "min_colliders": 1,
+  "max_colliders": 4,
+
+  "_context_note": "Hidden physics, resampled per segment — the alternating context.",
+  "context_param_specs": {
+    "visc_model":       {"choices": ["Newtonian", "PowerLaw", "Carreau", "HerschelBulkley"]},
+    "visc_n":           {"dist": "uniform",   "low": 0.3,  "high": 1.8},
+    "visc_min_factor":  {"dist": "uniform",   "low": 0.1,  "high": 0.6},
+    "visc_gamma_scale": {"dist": "loguniform","low": 2.0,  "high": 40.0},
+
+    "viscosity":        {"dist": "loguniform","low": 3e-4, "high": 6e-2},
+    "visc_bulk":        {"dist": "loguniform","low": 1e-3, "high": 3e-1},
+    "thermal_cond":     {"dist": "loguniform","low": 5e-7, "high": 5e-3},
+    "C_v":              {"dist": "uniform",   "low": 1.5,  "high": 3.0},
+    "gamma":            {"dist": "uniform",   "low": 1.1,  "high": 1.67}
+  },
+
+  "_ic_note": "Freestream/BC, sampled once per trajectory and held fixed across all its segments.",
+  "ic_param_specs": {
+    "rho_inf":          {"dist": "uniform",   "low": 0.5,  "high": 2.0},
+    "T_inf":            {"dist": "uniform",   "low": 80.0, "high": 140.0},
+    "v_n_inf":          {"dist": "uniform",   "low": 2.0,  "high": 7.0},
+    "aoa_deg":          {"dist": "uniform",   "low": 0.0,  "high": 360.0}
+  },
+
+  "phys_overrides": {}
+}
