@@ -4,7 +4,7 @@
   "n_meshes": 8,
   "trajs_per_mesh": 16,
   "n_segments": 4,
-  "seed": 42,
+  "seed": null,
   "steps_per_segment": 30,
   "save_t_spec": {
     "dist": "uniform",

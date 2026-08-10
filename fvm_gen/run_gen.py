@@ -119,7 +119,10 @@ class GenConfig:
     problem: "Union[str, list]" = "ellipse"  # "ellipse" | "nozzle" | a list to mix per mesh
     n_meshes: int = 8                 # distinct collider geometries
     runs_per_mesh: int = 16           # LEGACY mode only: parameter draws per geometry
-    seed: int = 42
+    # None = fresh entropy per invocation, recorded in the manifest (see
+    # gen_alternating.AltConfig.seed for the duplication bug a fixed default
+    # caused).  Set an int only to replay a corpus.
+    seed: Optional[int] = None
 
     # --- in-context grid mode (preferred) --------------------------------------
     # The model must INFER the context (hidden physics) from observed transitions,
@@ -265,7 +268,9 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
             f"config, or set runs_per_mesh=1 for one run per geometry."
         )
 
-    rng = np.random.default_rng(gen.seed)
+    seed = gen.seed if gen.seed is not None else __import__('secrets').randbits(32)
+    print(f"[gen] seed = {seed}")
+    rng = np.random.default_rng(seed)
     # Output dir precedence: explicit --out-dir (used as the root directly) >
     # data/<output_subdir> default.  Lets a caller drop the dataset on a specific
     # filesystem (e.g. Dawn's /rds scratch) without editing the config.
@@ -278,8 +283,8 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
     device = mesh_over = None
     if not dry_run:
         _import_solver()
-        np.random.seed(gen.seed)
-        torch.manual_seed(gen.seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         device = os.environ.get("FVM_DEVICE")
         mesh_over = {k: v for k, v in {"min_A": gen.min_A, "max_A": gen.max_A,
                                        "lnscale": gen.lnscale, "device": device}.items()
@@ -289,7 +294,7 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
     print(f"Output root: {out_root}   device: {device or '-'}   "
           f"problems: {problems}   dry_run: {dry_run}")
 
-    manifest = {"problems": problems, "n_meshes": gen.n_meshes,
+    manifest = {"problems": problems, "seed": seed, "n_meshes": gen.n_meshes,
                 "mode": "grid" if grid_mode else "legacy",
                 "n_context": gen.n_context if grid_mode else None,
                 "n_ic": gen.n_ic if grid_mode else None,

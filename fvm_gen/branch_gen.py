@@ -261,7 +261,10 @@ def main():
                    help="cap on source runs per mesh (default: all)")
     p.add_argument("--first-frame", type=int, default=20,
                    help="skip this many initial (transient) frames when sampling states")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=None,
+                   help="None (default) draws fresh entropy per invocation, so "
+                        "parallel/repeated branch jobs sample DIFFERENT source "
+                        "frames and physics. Pass an int only to replay.")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the solver step (off by default — branches are "
                         "short, so compile overhead dominates)")
@@ -279,7 +282,9 @@ def main():
     args = p.parse_args()
 
     root = os.path.abspath(args.data)
-    rng = np.random.default_rng(args.seed)
+    seed = args.seed if args.seed is not None else __import__("secrets").randbits(32)
+    print(f"[branch_gen] seed = {seed}")
+    rng = np.random.default_rng(seed)
     mesh_dirs = find_mesh_dirs(root)
     if not mesh_dirs:
         raise SystemExit(f"No shared_mesh.pkl found under {root}")

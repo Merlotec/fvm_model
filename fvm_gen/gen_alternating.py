@@ -54,7 +54,14 @@ class AltConfig:
     n_meshes: int = 8                 # distinct collider geometries
     trajs_per_mesh: int = 16          # alternating trajectories per geometry
     n_segments: int = 4               # context switches per trajectory (segments in the chain)
-    seed: int = 42
+    # None (the default) draws a fresh seed from OS entropy and records it in
+    # manifest.json, so every invocation generates NEW data while remaining
+    # reproducible after the fact.  Set an int only to deliberately replay a
+    # specific corpus.  A fixed default here caused every parallel/repeated
+    # invocation to regenerate IDENTICAL meshes, ICs, physics and save_t
+    # sequences under different run uids -- silently duplicating the corpus and
+    # leaking "held-out" runs into training as byte-copies.
+    seed: Optional[int] = None
 
     # A segment is steps_per_segment saved frames at a per-segment save_t drawn from
     # save_t_spec — the frame rate alternates along with the context, and the segment's
@@ -125,7 +132,10 @@ def run_alternating(gen: AltConfig, dry_run: bool = False, out_dir: Optional[str
     if gen.steps_per_segment < 1:
         raise SystemExit(f"steps_per_segment={gen.steps_per_segment}: must be >= 1.")
 
-    rng = np.random.default_rng(gen.seed)
+    seed = gen.seed if gen.seed is not None else secrets.randbits(32)
+    print(f"[gen] seed = {seed}" + ("" if gen.seed is not None
+          else "  (drawn from entropy; recorded in manifest.json)"))
+    rng = np.random.default_rng(seed)
     out_root = os.path.abspath(out_dir) if out_dir else os.path.join(
         RG._DEFAULT_DATA_DIR, gen.output_subdir)
     problems = gen.problem if isinstance(gen.problem, list) else [gen.problem]
@@ -133,8 +143,8 @@ def run_alternating(gen: AltConfig, dry_run: bool = False, out_dir: Optional[str
     device = mesh_over = None
     if not dry_run:
         RG._import_solver()
-        np.random.seed(gen.seed)
-        torch.manual_seed(gen.seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         device = os.environ.get("FVM_DEVICE")
         mesh_over = {k: v for k, v in {"min_A": gen.min_A, "max_A": gen.max_A,
                                        "lnscale": gen.lnscale, "device": device}.items()
@@ -147,6 +157,7 @@ def run_alternating(gen: AltConfig, dry_run: bool = False, out_dir: Optional[str
     manifest = {"problems": problems, "mode": "alternating",
                 "n_meshes": gen.n_meshes, "trajs_per_mesh": gen.trajs_per_mesh,
                 "n_segments": gen.n_segments,
+                "seed": seed,
                 "steps_per_segment": gen.steps_per_segment,
                 "save_t_spec": gen.save_t_spec, "runs": []}
 

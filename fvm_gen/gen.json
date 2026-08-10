@@ -4,7 +4,7 @@
   "n_meshes": 12,
   "n_context": 12,
   "n_ic": 6,
-  "seed": 42,
+  "seed": null,
   "save_t": 0.01,
   "n_iter": 12000,
   "print_i": 500,
