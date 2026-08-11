@@ -7,9 +7,9 @@
   "seed": null,
   "steps_per_segment": 30,
   "save_t_spec": {
-    "dist": "uniform",
+    "dist": "loguniform",
     "low": 0.01,
-    "high": 0.2
+    "high": 0.04
   },
   "n_iter": 200000,
   "print_i": 500,

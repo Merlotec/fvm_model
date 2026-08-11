@@ -4,7 +4,7 @@ Alternating-context rollout generator for the FVM solver.
 One trajectory = one continuous physical rollout on one mesh, during which the hidden
 physics context (viscosity model/params, thermal conductivity, gamma, ...) is RESAMPLED
 every segment.  A segment is steps_per_segment SAVED FRAMES long (default 30), at a
-per-segment frame interval save_t drawn from save_t_spec (default U(0.01, 0.2)) — so
+per-segment frame interval save_t drawn from save_t_spec (default LogU(0.01, 0.04)) — so
 segment sim-duration is steps_per_segment * save_t and both the context AND the frame
 rate alternate.  save_t is recorded in each segment's params.json.  Each context segment
 is written to its own run directory (params.json = that segment's context, frames
@@ -67,13 +67,22 @@ class AltConfig:
     # save_t_spec — the frame rate alternates along with the context, and the segment's
     # sim-duration is steps_per_segment * save_t (end_t lands exactly on the last frame
     # since it is a multiple of save_t by construction).
+    #
+    # Range chosen from the flow's own timescales (domain 2x2 at 256 px, u in
+    # [2,7], collider D ~ 0.16-0.4, St ~ 0.2): displacement per step is
+    # u*save_t*128 px, so 0.01 -> ~5 px (clean optical flow) and 0.04 -> ~23 px
+    # (about a patch and a half); beyond ~0.05 the worst-case shedding period (~0.11)
+    # drops under 2 frames/period and the dynamics alias.  The old U(0.01, 0.2)
+    # put 75% of the corpus above 0.05 — trans-domain displacements where
+    # next-state prediction degenerates into "generate a plausible successor".
+    # LOG-uniform for equal mass per octave, matching the probe's log-dt target.
     steps_per_segment: int = 30
     save_t_spec: dict = field(default_factory=lambda: {
-        "dist": "uniform", "low": 0.01, "high": 0.2})
+        "dist": "loguniform", "low": 0.01, "high": 0.04})
 
     # Solver run controls (applied to every segment).
     n_iter: int = 200000              # per-segment iteration safety cap (stop is end_t;
-                                      # 30 steps at save_t=0.2 is ~6 s sim time)
+                                      # 30 steps at save_t=0.04 is 1.2 s sim time)
     print_i: int = 500
     compile: bool = True
 
