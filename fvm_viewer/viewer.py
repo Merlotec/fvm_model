@@ -61,6 +61,10 @@ from dash import dcc, html, Input, Output, State, callback_context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'fvm_gen'))
 from renderer import MeshRenderer
+from strip_export import (FIELD_NAMES, RESOLUTION, _LUT, _build_lut, _apply_cmap,
+                          load_mesh, build_renderer, find_timestep_files, t_of_file,
+                          load_step, load_gen_frame, load_gen_refined, closest_idx,
+                          _render_field_strip, _strip_indices, _strip_png_bytes)
 
 
 def _add_solver_to_path() -> None:
@@ -83,36 +87,14 @@ def _add_solver_to_path() -> None:
 
 _add_solver_to_path()
 
-FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
-RESOLUTION  = (512, 512)
 
-# Colormap LUTs precomputed once at startup — safe to use from any thread.
-def _build_lut(name: str) -> np.ndarray:
-    from matplotlib import colormaps
-    return (colormaps[name](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
 
-_LUT: dict[str, np.ndarray] = {}   # populated lazily on first use, before any Dash callbacks
 
 
 # ---------------------------------------------------------------------------
 # Video export helpers
 # ---------------------------------------------------------------------------
 
-def _apply_cmap(data: np.ndarray, cmap_name: str,
-                vmin: float, vmax: float, out_w: int, out_h: int) -> np.ndarray:
-    """Apply a precomputed colormap LUT; returns uint8 RGB [out_h, out_w, 3].
-    Pure numpy — safe to call from any thread, no matplotlib in the hot path.
-    """
-    from PIL import Image
-    if cmap_name not in _LUT:
-        _LUT[cmap_name] = _build_lut(cmap_name)
-    lut  = _LUT[cmap_name]
-    norm = np.clip((data.astype(np.float32) - vmin) / max(vmax - vmin, 1e-8), 0, 1)
-    idx  = (norm * 255).astype(np.uint8)
-    rgb  = lut[idx]                                        # [H, W, 3] uint8
-    if rgb.shape[:2] != (out_h, out_w):
-        rgb = np.array(Image.fromarray(rgb).resize((out_w, out_h), Image.Resampling.BILINEAR))
-    return rgb
 
 
 def _render_frame_rgb(
@@ -185,6 +167,12 @@ def _render_frame_rgb(
             canvas.paste(Image.fromarray(grad_rgb), (x0, y_scale))
 
     return np.array(canvas)
+
+
+
+
+
+
 
 
 def _encode_apng(frames: list[np.ndarray], fps: int = 8) -> bytes:
@@ -338,58 +326,8 @@ def group_by_mesh_dir(root_dir: str, run_dirs: list[str]) -> tuple[list[dict], l
     return mesh_options, mesh_run_options
 
 
-def load_mesh(run_dir: str) -> dict:
-    d = np.load(os.path.join(run_dir, "mesh_props.npz"), allow_pickle=True)
-    return {k: d[k] for k in d.files}
 
 
-def build_renderer(run_dir: str, resolution: tuple[int, int]) -> MeshRenderer:
-    H, W = resolution
-    mesh_npz   = os.path.join(run_dir, "mesh_props.npz")
-    parent_dir = os.path.dirname(run_dir)
-    shared_pkl = os.path.join(parent_dir, "shared_mesh.pkl")
-
-    if os.path.exists(mesh_npz):
-        # Old format: per-run mesh stored alongside the data
-        cache_path = os.path.join(run_dir, f"renderer_cache_{H}x{W}.pt")
-        if os.path.exists(cache_path):
-            return MeshRenderer.from_cache(cache_path, device="cpu")
-        mesh = load_mesh(run_dir)
-        renderer = MeshRenderer(
-            vertices=mesh["vertices"], triangles=mesh["triangles"],
-            resolution=resolution, device="cpu",
-        )
-    elif os.path.exists(shared_pkl):
-        # New format: shared mesh at dataset level, cache stored there too
-        cache_path = os.path.join(parent_dir, f"renderer_cache_{H}x{W}.pt")
-        with open(shared_pkl, "rb") as f:
-            mesh_dict = pickle.load(f)
-        fvm_mesh = mesh_dict["mesh"]
-        verts = fvm_mesh.vertices.cpu().numpy()
-        n_cells = int(fvm_mesh.cells.shape[0])
-        x0, x1 = float(verts[:, 0].min()), float(verts[:, 0].max())
-        y0, y1 = float(verts[:, 1].min()), float(verts[:, 1].max())
-        if os.path.exists(cache_path):
-            _r = MeshRenderer.from_cache(cache_path, device="cpu")
-            eps = 1e-3
-            if (_r._c2v_tri.max().item() + 1 == n_cells
-                    and abs(_r.xlim[0] - x0) < eps and abs(_r.xlim[1] - x1) < eps
-                    and abs(_r.ylim[0] - y0) < eps and abs(_r.ylim[1] - y1) < eps):
-                return _r
-            print(f"  Viewer renderer cache stale, rebuilding...")
-            os.unlink(cache_path)
-        renderer = MeshRenderer(
-            vertices=verts,
-            triangles=fvm_mesh.cells.cpu().numpy(),
-            resolution=resolution, device="cpu",
-        )
-    else:
-        raise FileNotFoundError(
-            f"No mesh found for {run_dir}: checked {mesh_npz} and {shared_pkl}"
-        )
-
-    renderer.save_cache(cache_path)
-    return renderer
 
 
 def build_renderers(run_dirs: list[str], resolution: tuple[int, int]) -> dict[str, MeshRenderer]:
@@ -409,40 +347,16 @@ def build_renderers(run_dirs: list[str], resolution: tuple[int, int]) -> dict[st
     return out
 
 
-def find_timestep_files(run_dir: str) -> list[str]:
-    files = [f for f in os.listdir(run_dir) if f.startswith("t_") and f.endswith(".npz")]
-    files.sort(key=lambda f: float(f[2:-4]))
-    return [os.path.join(run_dir, f) for f in files]
 
 
-def t_of_file(path: str) -> float:
-    return float(os.path.basename(path)[2:-4])
 
 
-def load_step(path: str) -> tuple[float, np.ndarray]:
-    """Load a raw FVM timestep file; returns (t, cell_primatives) denormalised."""
-    d = np.load(path)
-    return float(d["t"]), d["cell_primatives"].astype(np.float32) * d["prim_std"] + d["prim_mean"]
 
 
-def load_gen_frame(path: str) -> tuple[float, np.ndarray, bool]:
-    """Load a generated frame; returns (t, grid (4,H,W), is_seed)."""
-    d = np.load(path)
-    return float(d["t"]), d["grid"].astype(np.float32), bool(d["is_seed"])
 
 
-def load_gen_refined(path: str) -> Optional[np.ndarray]:
-    """Optional flow-matching refiner output for a generated frame: grid (4,H,W),
-    or None if the frame carries no refined data (seed frames, or an inference run
-    without --refine)."""
-    d = np.load(path)
-    if "grid_refined" not in d.files:
-        return None
-    return d["grid_refined"].astype(np.float32)
 
 
-def closest_idx(files: list[str], target_t: float) -> int:
-    return min(range(len(files)), key=lambda i: abs(t_of_file(files[i]) - target_t))
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +500,7 @@ def _sidebar(run_options: list[dict], mesh_options: Optional[list[dict]] = None)
               "borderRight": "1px solid #ddd", "overflowY": "auto", "fontFamily": "monospace"})
 
 
-def _nav_bar() -> html.Div:
+def _nav_bar(show_refined: bool = False) -> html.Div:
     return html.Div([
         html.Button("◀  Prev", id="btn-prev", n_clicks=0,
                     style={"fontSize": "13px", "padding": "5px 16px", "cursor": "pointer"}),
@@ -607,6 +521,42 @@ def _nav_bar() -> html.Div:
             type="dot",
         ),
         dcc.Download(id="video-download"),
+        # ---- one-field filmstrip export: N frames as columns in a single PNG ----
+        html.Div(style={"width": "1px", "background": "#ddd", "alignSelf": "stretch",
+                        "margin": "0 12px"}),
+        dcc.Dropdown(id="strip-field", value="rho", clearable=False,
+                     options=[{"label": f, "value": f} for f in FIELD_NAMES],
+                     style={"width": "72px", "fontSize": "12px"}),
+        html.Div(dcc.Input(id="strip-start", type="number", value=0, min=0, step=1,
+                           style={"width": "56px", "fontSize": "12px"}),
+                 title=("first frame (rollout t: 0 = last seed, 1 = first prediction)"
+                        if show_refined else "first frame (step index)"),
+                 style={"marginLeft": "6px"}),
+        html.Div(dcc.Input(id="strip-stride", type="number", value=1, min=1, step=1,
+                           style={"width": "48px", "fontSize": "12px"}),
+                 title="frame delta (take every k-th frame)", style={"marginLeft": "4px"}),
+        html.Div(dcc.Input(id="strip-count", type="number", value=8, min=1, step=1,
+                           style={"width": "48px", "fontSize": "12px"}),
+                 title="number of frames", style={"marginLeft": "4px"}),
+        # Compare mode only: add a third row with the flow-matching refiner output
+        # (grid_refined from infer.py --refine).  Hidden in the normal viewer, where
+        # there is nothing to refine.
+        html.Div(
+            dcc.Checklist(id="strip-refined",
+                          options=[{"label": " refined", "value": "refined"}], value=[],
+                          style={"fontSize": "12px", "whiteSpace": "nowrap"}),
+            title="include the refiner output as a third row",
+            style={"marginLeft": "8px", "display": "block" if show_refined else "none"},
+        ),
+        dcc.Loading(
+            html.Button("⬇ Frames", id="btn-download-strip", n_clicks=0,
+                        title="export the selected frames of one field as columns in a still image",
+                        style={"fontSize": "12px", "padding": "5px 12px", "cursor": "pointer",
+                               "marginLeft": "6px", "borderRadius": "4px",
+                               "border": "1px solid #aaa", "background": "#fff"}),
+            type="dot",
+        ),
+        dcc.Download(id="strip-download"),
     ], style={"display": "flex", "alignItems": "center", "padding": "8px 12px",
               "borderTop": "1px solid #ddd"})
 
@@ -795,7 +745,7 @@ def build_app(root_dir: str, sample: Optional[int] = None,
         # Pass 2: render frames (each ~1.8 MB as PIL — safe to accumulate)
         frames: list[np.ndarray] = []
         prev_grid = None
-        for path in files:
+        for step_idx, path in enumerate(files):
             t, cp = load_step(path)
             grid  = renderers[run_dir].render_cell_smooth(cp).numpy()
             frames.append(_render_frame_rgb(
@@ -803,13 +753,37 @@ def build_app(root_dir: str, sample: Optional[int] = None,
                 view_mode=view_mode,
                 prev_rows=[prev_grid] if (view_mode == 'delta' and prev_grid is not None) else None,
                 zranges=zranges,
-                title=f'{name}   t = {t:.4g}',
+                title=str(step_idx),   # integer step only — no run name / sim time
             ))
             prev_grid = grid
 
         video_bytes = _encode_apng(frames)
         print(f'APNG ready ({len(video_bytes) // 1024} KB)')
         return dcc.send_bytes(video_bytes, filename=f'{name}.png'), ''
+
+    @app.callback(
+        Output("strip-download", "data"),
+        Input("btn-download-strip", "n_clicks"),
+        State("state", "data"),
+        State("strip-field", "value"), State("strip-start", "value"),
+        State("strip-stride", "value"), State("strip-count", "value"),
+        prevent_initial_call=True,
+    )
+    def download_strip(_n, state, field, start, stride, count):
+        run_dir = run_dirs[state["run_idx"]]
+        files = all_files[run_dir]
+        idxs = _strip_indices(start, stride, count, len(files))
+        if not idxs:
+            return dash.no_update
+        fi = FIELD_NAMES.index(field)
+        grids = []
+        for i in idxs:
+            _, cp = load_step(files[i])
+            grids.append(renderers[run_dir].render_cell_smooth(cp).numpy()[fi])
+        name = labels[state["run_idx"]].replace(os.sep, "_")
+        png = _strip_png_bytes([grids], field, idxs)
+        fname = f"{name}_{field}_s{idxs[0]}_d{max(1, int(stride or 1))}_n{len(idxs)}.png"
+        return dcc.send_bytes(png, filename=fname)
 
     @app.callback(
         Output("params-display", "children"),
@@ -875,6 +849,10 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
         gen_run_dirs  = [gen_run_dirs[i] for i in keep_i]
 
     mesh_options, mesh_run_options = group_by_mesh_dir(real_root_abs, real_run_dirs)
+    # Mesh-qualified labels (mesh_<uid>/run_<uid>) for the header — the exact relative
+    # path of the REAL run, so it can be copied straight into e.g. a report_pipeline
+    # config even when the runs were matched by bare name.
+    real_labels = [run_label(real_root_abs, d) for d in real_run_dirs]
     sampled = f" (sampled from {n_matched})" if len(run_names) != n_matched else ""
     print(f"Found {len(run_names)} common run(s){sampled} across {len(mesh_options)} "
           f"mesh dir(s), matched by {matched_by}.")
@@ -939,7 +917,7 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
         ], style={"padding": "8px 12px", "borderBottom": "1px solid #ddd", "display": "flex", "alignItems": "baseline"}),
         html.Div([
             _sidebar(opts, mesh_options),
-            html.Div([plot_area, _nav_bar()],
+            html.Div([plot_area, _nav_bar(show_refined=True)],
                      style={"flex": "1", "overflow": "auto", "display": "flex", "flexDirection": "column"}),
         ], style={"display": "flex", "flex": "1", "overflow": "hidden"}),
         dcc.Store(id="state", data={"run_idx": 0, "step_idx": 0}),
@@ -1038,7 +1016,7 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
         n         = len(gen_files)
 
         params_str = _params_header_str(params)
-        header = f"{run_names[run_idx]}   |   t = {relative_t}  ({frame_tag})"
+        header = f"{real_labels[run_idx]}   |   t = {relative_t}  ({frame_tag})"
         if params_str:
             header += f"   |   {params_str}"
 
@@ -1130,7 +1108,10 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
         # Pass 2: render frames (each ~1.8 MB as PIL — safe to accumulate)
         frames: list[np.ndarray] = []
         prev_real = prev_gen = None
-        for gf in gen_files:
+        # Rollout-relative indexing, same as the page header and the eval logs:
+        # last seed frame = t 0, predictions = t 1, 2, ... (earlier seeds negative).
+        t_off = n_seed_map[gen_dir] - 1
+        for step_idx, gf in enumerate(gen_files):
             t, gg, _ = load_gen_frame(gf)
             ri = closest_idx(real_files, t)
             _, rcp = load_step(real_files[ri])
@@ -1142,13 +1123,60 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
                 view_mode=view_mode,
                 prev_rows=prev_rows,
                 zranges=zranges,
-                title=f'{name}   t = {t:.4g}',
+                title=str(step_idx - t_off),   # rollout t only — no run name / sim time
             ))
             prev_real, prev_gen = rg, gg
 
         video_bytes = _encode_apng(frames)
         print(f'APNG ready ({len(video_bytes) // 1024} KB)')
         return dcc.send_bytes(video_bytes, filename=f'{name}_comparison.png'), ''
+
+    @app.callback(
+        Output("strip-download", "data"),
+        Input("btn-download-strip", "n_clicks"),
+        State("state", "data"),
+        State("strip-field", "value"), State("strip-start", "value"),
+        State("strip-stride", "value"), State("strip-count", "value"),
+        State("strip-refined", "value"),
+        prevent_initial_call=True,
+    )
+    def download_strip(_n, state, field, start, stride, count, refined_opt):
+        run_idx    = state["run_idx"]
+        gen_files  = gen_files_map[gen_run_dirs[run_idx]]
+        real_files = real_files_map[real_run_dirs[run_idx]]
+        # The whole strip works in rollout-relative t (last seed = 0, predictions =
+        # 1, 2, ... — same as the page header and the eval logs): the start box is a
+        # rollout t, and the printed column headers are rollout t.
+        t_off = n_seed_map[gen_run_dirs[run_idx]] - 1
+        idxs = _strip_indices(max(0, int(start or 0)) + t_off, stride, count, len(gen_files))
+        if not idxs:
+            return dash.no_update
+        step_ids = [i - t_off for i in idxs]
+        fi = FIELD_NAMES.index(field)
+        include_refined = bool(refined_opt) and "refined" in refined_opt
+        real_row, gen_row, detail_row = [], [], []
+        for i in idxs:
+            t, gg, _ = load_gen_frame(gen_files[i])
+            gen_row.append(gg[fi])
+            _, rcp = load_step(real_files[closest_idx(real_files, t)])
+            real_row.append(renderers[real_run_dirs[run_idx]].render_cell_smooth(rcp).numpy()[fi])
+            if include_refined:
+                # Same as the live compare page: show the refiner's RESIDUAL
+                # (refined - generated), not the refined field itself.  None for
+                # seed frames / runs without --refine -> "n/a" cell.
+                rg = load_gen_refined(gen_files[i])
+                detail_row.append(rg[fi] - gg[fi] if rg is not None else None)
+        name = run_names[run_idx].replace(os.sep, "_")
+        kwargs = {}
+        if include_refined:
+            present = [d for d in detail_row if d is not None]
+            kwargs = dict(detail_row=detail_row,
+                          detail_maxabs=max((float(np.abs(d).max()) for d in present),
+                                            default=1.0) or 1.0)
+        png = _strip_png_bytes([real_row, gen_row], field, step_ids,
+                               row_labels=["Real", "Generated"], **kwargs)
+        fname = f"{name}_{field}_s{step_ids[0]}_d{max(1, int(stride or 1))}_n{len(idxs)}.png"
+        return dcc.send_bytes(png, filename=fname)
 
     @app.callback(
         Output("params-display", "children"),

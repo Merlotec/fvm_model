@@ -1,0 +1,16 @@
+{
+  "_comment": "See scripts/report_pipeline.py docstring. Every model runs every rollout; outputs land in <out_root>/<tag>_<run_id>/. frames_per_image is the GLOBAL columns-per-filmstrip constant; n_predict = stride * (frames_per_image - 1).",
+  "out_root":         "report",
+  "frames_per_image": 6,
+  "refine_steps": 6,
+  "models": [
+    { "tag": "a",
+      "dynamics_ckpt": "../hfm/checkpoints/dynamics_a.ckpt",
+      "refiner_ckpt":  "../hfm/checkpoints/refiner_a.pt" }
+  ],
+  "rollouts": [
+    { "run_dir": "../data/fvm_validation/mesh_b66f0d20/run_c000_i001_78fab81c",
+      "fields": ["Vx"],
+      "stride": 5 }
+  ]
+}

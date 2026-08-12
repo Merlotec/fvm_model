@@ -50,3 +50,8 @@ data
 data-bk
 checkpoints*
 out
+
+# Generated report/pipeline output (scripts/report_pipeline.py out_root):
+# figures + CSVs are regenerated from checkpoints, so they never belong in git.
+rollout
+report
