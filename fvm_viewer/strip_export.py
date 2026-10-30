@@ -35,8 +35,40 @@ _add_solver_to_path()
 
 FIELD_NAMES = ["Vx", "Vy", "rho", "T"]
 
+# Human-readable names for display.  Two forms because the destinations differ:
+# the image is drawn by PIL (plain text, so only glyphs DejaVu actually has), the
+# caption is LaTeX (real maths).  FIELD_NAMES stays the key everywhere else --
+# config values, filenames, channel order -- so nothing downstream shifts.
+FIELD_LABELS = {
+    "Vx":  "x velocity (Vx)",
+    "Vy":  "y velocity (Vy)",
+    "rho": "density (\u03c1)",
+    "T":   "temperature (T)",
+}
+FIELD_TEX = {
+    "Vx":  r"$x$ velocity ($v_x$)",
+    "Vy":  r"$y$ velocity ($v_y$)",
+    "rho": r"density ($\rho$)",
+    "T":   r"temperature ($T$)",
+}
+
+
+def field_label(f: str) -> str:
+    """Plain-text display name for the image (falls back to the raw key)."""
+    return FIELD_LABELS.get(f, f)
+
+
+def field_tex(f: str) -> str:
+    """LaTeX display name for captions (falls back to \texttt{key})."""
+    return FIELD_TEX.get(f, rf"\texttt{{{f}}}")
+
 
 RESOLUTION  = (512, 512)
+
+# Fill for pixels outside the fluid mesh (see _render_field_strip's value_mask).
+# Mid grey: no viridis or RdBu_r entry is close to neutral, so solid geometry
+# cannot be mistaken for a field value at either end of the scale.
+_MASK_RGB = (145, 145, 145)
 
 
 # Colormap LUTs precomputed once at startup — safe to use from any thread.
@@ -83,7 +115,11 @@ def _render_field_strip(rows: list[list[np.ndarray]], field_name: str,
                         zmin: float, zmax: float, step_ids: list[int],
                         row_labels: Optional[list[str]] = None,
                         detail_row: Optional[list] = None,
-                        detail_maxabs: float = 1.0) -> np.ndarray:
+                        detail_maxabs: float = 1.0,
+                        context_row: Optional[list] = None,
+                        context_label: str = '',
+                        context_rows: Optional[list] = None,
+                        value_mask: Optional[np.ndarray] = None) -> np.ndarray:
     """One-field filmstrip: selected frames as consecutive columns in ONE still image.
 
     rows: [n_rows][n_cols] of 2D field arrays — a single row in the normal viewer,
@@ -94,13 +130,43 @@ def _render_field_strip(rows: list[list[np.ndarray]], field_name: str,
     on its own symmetric RdBu_r scale with its own colourbar.  A None cell (seed
     frame, no refiner output) renders as a grey "n/a" placeholder.  Column headers
     carry the integer step index.
+
+    `context_row` prepends the model's INPUT frames above everything else, cut off
+    by a heavy dark rule: those frames precede t=0 and run most-recent-first, so
+    their columns do NOT line up with the rollout columns below and the divider has
+    to say so.  Their colour range is the rollout's, so enabling the block never
+    restyles the rows beneath it.
+
+    `context_rows` is the multi-row form: [(label, row), ...] stacked above the same
+    heavy rule.  Two of them is the context-comparison figure -- the run's own
+    history and the one actually fed to the encoder -- which only reads if both are
+    on screen together.  `context_row`/`context_label` remain the single-row
+    shortcut and are folded into the same list.
+
+    `value_mask` (H, W bool, True inside the fluid) marks pixels outside the mesh.
+    They hold the renderer's 0 fill rather than a field value, so they are painted
+    a flat neutral grey instead of being colour-mapped -- see _strip_png_bytes,
+    which also excludes them from the range.
     """
     from PIL import Image, ImageDraw
     CELL, HEAD_H, BAR_H, LABEL_H, SCALE_H = 256, 46, 42, 40, 26
+    SEP_H = 14                      # heavy rule under the context block
     # Real (scalable) font: PIL's default bitmap font is ~10 px, unreadable once the
     # strip is scaled to a paper's \linewidth.  DejaVu Sans ships with matplotlib
     # (already a dependency); sized default as fallback.
     fnt_head, fnt_bar, fnt_scale = _font(30), _font(27), _font(24)
+
+    def _fit(draw_obj, text, max_w, start=27):
+        """Largest font (down to 14px) whose `text` fits `max_w`.
+
+        Row labels are prose and the strip can be as narrow as two columns, so a
+        fixed size silently runs off the canvas -- which is how the context label
+        lost its second half."""
+        for sz in range(start, 13, -3):
+            f = _font(sz)
+            if draw_obj.textlength(text, font=f) <= max_w:
+                return f
+        return _font(14)
     n_cols = len(rows[0])
     with_bars = row_labels is not None
     total_w = n_cols * CELL
@@ -108,27 +174,50 @@ def _render_field_strip(rows: list[list[np.ndarray]], field_name: str,
                + LABEL_H + SCALE_H)
     if detail_row is not None:
         total_h += (BAR_H if with_bars else 0) + CELL + LABEL_H + SCALE_H
+    ctx_blocks = list(context_rows) if context_rows else []
+    if context_row is not None:
+        ctx_blocks.insert(0, (context_label, context_row))
+    if ctx_blocks:
+        total_h += len(ctx_blocks) * (BAR_H + CELL) + SEP_H
 
     canvas = Image.new('RGB', (total_w, total_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
-    for ci, sid in enumerate(step_ids):
-        draw.text((ci * CELL + CELL // 2, HEAD_H // 2), str(sid), fill=(20, 20, 20),
-                  anchor='mm', font=fnt_head)
 
-    def _cells(y, row, cmap, lo, hi):
+    def _header(y):
+        """Column numbers, titled.  Drawn directly above the rollout rows (i.e.
+        BELOW any context block) because they index the rollout columns only --
+        the context frames above them are not on this numbering."""
+        # Label and numbers share one font size so the row reads as a single line.
+        draw.text((8, y + HEAD_H // 2), 'Frame:', fill=(90, 90, 90),
+                  anchor='lm', font=fnt_scale)
+        for ci, sid in enumerate(step_ids):
+            draw.text((ci * CELL + CELL // 2, y + HEAD_H // 2), str(sid),
+                      fill=(20, 20, 20), anchor='mm', font=fnt_scale)
+
+    def _cells(y, row, cmap, lo, hi, placeholder="n/a"):
         for ci, g in enumerate(row):
             if g is None:
                 draw.rectangle([ci * CELL, y, (ci + 1) * CELL - 1, y + CELL - 1],
                                fill=(240, 240, 240))
-                draw.text((ci * CELL + CELL // 2, y + CELL // 2), "n/a",
+                draw.text((ci * CELL + CELL // 2, y + CELL // 2), placeholder,
                           fill=(150, 150, 150), anchor='mm', font=fnt_head)
             else:
-                canvas.paste(Image.fromarray(_apply_cmap(g, cmap, lo, hi, CELL, CELL)),
-                             (ci * CELL, y))
+                rgb = _apply_cmap(g, cmap, lo, hi, CELL, CELL)
+                if value_mask is not None and value_mask.shape == g.shape:
+                    # Solid geometry: outside the mesh the array holds the
+                    # renderer's 0 fill, which after masking the range usually
+                    # sits below zmin and would clip to the colormap's end --
+                    # indistinguishable from a real extreme.  Flat grey instead.
+                    solid = np.array(Image.fromarray(
+                        (~value_mask).astype(np.uint8) * 255).resize(
+                            (CELL, CELL), Image.Resampling.NEAREST)) > 127
+                    rgb[solid] = _MASK_RGB
+                canvas.paste(Image.fromarray(rgb), (ci * CELL, y))
 
-    def _bar(y, text):
-        draw.rectangle([0, y, total_w, y + BAR_H - 1], fill=(235, 235, 235))
-        draw.text((8, y + BAR_H // 2), text, fill=(20, 20, 20), anchor='lm', font=fnt_bar)
+    def _bar(y, text, fill=(235, 235, 235)):
+        draw.rectangle([0, y, total_w, y + BAR_H - 1], fill=fill)
+        draw.text((8, y + BAR_H // 2), text, fill=(20, 20, 20), anchor='lm',
+                  font=_fit(draw, text, total_w - 16))
 
     def _scale(y, label, cmap, lo, hi):
         draw.rectangle([0, y, total_w, y + LABEL_H - 1], fill=(255, 255, 255))
@@ -142,7 +231,26 @@ def _render_field_strip(rows: list[list[np.ndarray]], field_name: str,
         canvas.paste(Image.fromarray(_apply_cmap(grad, cmap, lo, hi, total_w, SCALE_H)),
                      (0, y + LABEL_H))
 
-    y = HEAD_H
+    y = 0
+    if ctx_blocks:
+        # The model's INPUT frames, above the rollout and separated by a heavy
+        # rule: they precede t=0 and are ordered most-recent-first, so their
+        # columns do NOT correspond to the columns below.  Rendered on the SAME
+        # colour range as the rollout (identical field and units) but the range
+        # itself is computed from the rollout rows only, so switching this block
+        # on never changes how the rows below look.
+        for lab, row in ctx_blocks:
+            _bar(y, lab, fill=(205, 205, 205))
+            y += BAR_H
+            _cells(y, row, 'viridis', zmin, zmax, placeholder="")
+            y += CELL
+        # ONE rule under the whole block: it separates context from rollout, and
+        # drawing it per row would read as "these are different sections".
+        draw.rectangle([0, y, total_w, y + SEP_H - 1], fill=(45, 45, 45))
+        y += SEP_H
+    _header(y)
+    y += HEAD_H
+
     for ri, row in enumerate(rows):
         if with_bars:
             _bar(y, row_labels[ri]); y += BAR_H
@@ -150,12 +258,13 @@ def _render_field_strip(rows: list[list[np.ndarray]], field_name: str,
 
     if detail_row is not None:
         if with_bars:
-            _bar(y, "Refined residual (refined - generated)"); y += BAR_H
+            _bar(y, "Detail refiner residual"); y += BAR_H
         _cells(y, detail_row, 'RdBu_r', -detail_maxabs, detail_maxabs); y += CELL
 
-    _scale(y, field_name, 'viridis', zmin, zmax); y += LABEL_H + SCALE_H
+    disp = field_label(field_name)
+    _scale(y, disp, 'viridis', zmin, zmax); y += LABEL_H + SCALE_H
     if detail_row is not None:
-        _scale(y, f"{field_name}  refined - generated", 'RdBu_r',
+        _scale(y, f"{disp}  refined - generated", 'RdBu_r',
                -detail_maxabs, detail_maxabs)
     return np.array(canvas)
 
@@ -169,13 +278,54 @@ def _strip_indices(start, stride, count, n_files: int) -> list[int]:
     return [i for i in range(start, start + stride * count, stride) if i < n_files]
 
 
-def _strip_png_bytes(rows, field, step_ids, row_labels=None, **strip_kwargs) -> bytes:
+def fluid_mask(renderer, shape) -> Optional[np.ndarray]:
+    """(H, W) bool, True inside the fluid mesh, from the renderer's interior index.
+
+    This is the same source hfm's build_pixel_mask uses.  Deriving the mask from
+    the VALUES instead (nonzero / finite) would misclassify any fluid cell that is
+    legitimately zero, which velocity components hit routinely.  Returns None when
+    the renderer exposes no interior index, so callers fall back to their previous
+    whole-array behaviour rather than failing.
+    """
+    idx = getattr(renderer, "_interior_idx", None)
+    if idx is None:
+        return None
+    h, w = shape[-2], shape[-1]
+    flat = np.zeros(h * w, dtype=bool)
+    flat[np.asarray(idx.cpu() if hasattr(idx, "cpu") else idx)] = True
+    return flat.reshape(h, w)
+
+
+def _strip_png_bytes(rows, field, step_ids, row_labels=None,
+                     value_mask: Optional[np.ndarray] = None,
+                     **strip_kwargs) -> bytes:
+    """value_mask: (H, W) bool, True inside the fluid.
+
+    The renderer fills everything outside the mesh with 0 and the model multiplies
+    its output by the same mask, so those pixels are a constant 0 that has nothing
+    to do with the field.  Including them in the colour range pins one end at 0,
+    which for strictly-positive fields (rho, T, whose fluid values sit nowhere
+    near 0) squeezes the entire flow into a sliver of the colormap.  With a mask
+    the range comes from fluid pixels only and the masked ones are painted a
+    neutral grey instead of being clipped to an end of the scale, where they would
+    read as a genuine extreme value.
+    """
     import io
     from PIL import Image
-    flat = [g for row in rows for g in row if g is not None]
-    zmin = min(float(g.min()) for g in flat)
-    zmax = max(float(g.max()) for g in flat)
-    img = _render_field_strip(rows, field, zmin, zmax, step_ids, row_labels, **strip_kwargs)
+    # Range from the ROLLOUT rows only: an added context block must not restyle
+    # the comparison beneath it.
+    flat = [g for row in rows for g in row if g is not None]   # ROLLOUT rows only
+    if value_mask is not None:
+        vals = [g[value_mask] for g in flat if g.shape == value_mask.shape]
+        vals = [v for v in vals if v.size]
+        if not vals:                      # shape mismatch: fall back, don't crash
+            value_mask, vals = None, [g.ravel() for g in flat]
+    else:
+        vals = [g.ravel() for g in flat]
+    zmin = min(float(v.min()) for v in vals)
+    zmax = max(float(v.max()) for v in vals)
+    img = _render_field_strip(rows, field, zmin, zmax, step_ids, row_labels,
+                              value_mask=value_mask, **strip_kwargs)
     buf = io.BytesIO()
     Image.fromarray(img).save(buf, format='PNG')
     return buf.getvalue()

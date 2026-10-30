@@ -64,7 +64,8 @@ from renderer import MeshRenderer
 from strip_export import (FIELD_NAMES, RESOLUTION, _LUT, _build_lut, _apply_cmap,
                           load_mesh, build_renderer, find_timestep_files, t_of_file,
                           load_step, load_gen_frame, load_gen_refined, closest_idx,
-                          _render_field_strip, _strip_indices, _strip_png_bytes)
+                          _render_field_strip, _strip_indices, _strip_png_bytes,
+                          fluid_mask)
 
 
 def _add_solver_to_path() -> None:
@@ -781,7 +782,8 @@ def build_app(root_dir: str, sample: Optional[int] = None,
             _, cp = load_step(files[i])
             grids.append(renderers[run_dir].render_cell_smooth(cp).numpy()[fi])
         name = labels[state["run_idx"]].replace(os.sep, "_")
-        png = _strip_png_bytes([grids], field, idxs)
+        png = _strip_png_bytes([grids], field, idxs,
+                               value_mask=fluid_mask(renderers[run_dir], grids[0].shape))
         fname = f"{name}_{field}_s{idxs[0]}_d{max(1, int(stride or 1))}_n{len(idxs)}.png"
         return dcc.send_bytes(png, filename=fname)
 
@@ -1174,7 +1176,10 @@ def build_compare_app(real_root: str, gen_root: str, sample: Optional[int] = Non
                           detail_maxabs=max((float(np.abs(d).max()) for d in present),
                                             default=1.0) or 1.0)
         png = _strip_png_bytes([real_row, gen_row], field, step_ids,
-                               row_labels=["Real", "Generated"], **kwargs)
+                               row_labels=["Ground truth", "Generated"],
+                               value_mask=fluid_mask(
+                                   renderers[real_run_dirs[run_idx]],
+                                   real_row[0].shape), **kwargs)
         fname = f"{name}_{field}_s{step_ids[0]}_d{max(1, int(stride or 1))}_n{len(idxs)}.png"
         return dcc.send_bytes(png, filename=fname)
 

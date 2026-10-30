@@ -1,0 +1,78 @@
+{
+  "problem": "ellipse",
+  "n_samples": 4,
+  "save_t": 0.02,
+  "end_t": 10.0,
+  "n_iter": 4000000,
+  "param_specs": {
+    "viscosity": {
+      "values": [
+        0.04428042,
+        0.01006373,
+        0.00246002,
+        0.0004428
+      ]
+    },
+    "visc_bulk": {
+      "values": [
+        0.01,
+        0.01,
+        0.01,
+        0.01
+      ]
+    },
+    "thermal_cond": {
+      "values": [
+        0.0005,
+        0.0005,
+        0.0005,
+        0.0005
+      ]
+    },
+    "C_v": {
+      "values": [
+        2.2,
+        2.2,
+        2.2,
+        2.2
+      ]
+    },
+    "gamma": {
+      "values": [
+        1.4,
+        1.4,
+        1.4,
+        1.4
+      ]
+    },
+    "rho_inf": {
+      "values": [
+        1.2,
+        1.2,
+        1.2,
+        1.2
+      ]
+    },
+    "T_inf": {
+      "values": [
+        110.0,
+        110.0,
+        110.0,
+        110.0
+      ]
+    },
+    "v_n_inf": {
+      "values": [
+        4.0,
+        4.0,
+        4.0,
+        4.0
+      ]
+    }
+  },
+  "phys_overrides": {
+    "n_colliders": 1
+  },
+  "output_subdir": "fvm_demo",
+  "reuse_mesh": true
+}

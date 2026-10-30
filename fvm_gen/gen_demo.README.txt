@@ -1,0 +1,14 @@
+Demo set: four long rollouts, one per flow regime.
+Only `viscosity` varies -- Reynolds number is the sole difference, so the
+runs are directly comparable.  One shared mesh, ONE collider (diameter
+0.254), so the canonical bluff-body thresholds 47 / 190 / 1000 apply.
+
+Fixed: rho_inf 1.2, v_n_inf 4.0, T_inf 110.0, C_v 2.2, gamma 1.4,
+       visc_bulk 0.01, thermal_cond 5e-4, Newtonian, aoa 0 (axial).
+Delta t = 0.02, 501 frames (end_t 10 s).
+Mach = 0.344 for every run.
+
+  run_0000  steady recirculation     viscosity 0.04428042   -> Re     25
+  run_0001  periodic shedding        viscosity 0.01006373   -> Re    110
+  run_0002  shedding + transition    viscosity 0.00246002   -> Re    450
+  run_0003  turbulent wake           viscosity 0.0004428    -> Re   2500

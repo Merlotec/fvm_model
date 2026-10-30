@@ -153,9 +153,30 @@ class GenConfig:
     ic_param_specs: dict[str, dict] = field(default_factory=dict)
 
     # Solver run controls (applied to every run).
-    save_t: float = 0.01              # sim-time between saved frames
-    n_iter: int = 10000               # max solver iterations
-    end_t: Optional[float] = None        # max sim time (optional; None => run n_iter steps)
+    #
+    # save_t_spec, when given, replaces the fixed `save_t` with a draw PER CONTEXT
+    # (per run in legacy mode) and records it in params.json, exactly as
+    # gen_alternating does.  Both halves of that matter for context-switch
+    # training:
+    #   * a corpus at one fixed interval gives the dt probe a constant target
+    #     (hfm/data.py warns "constant -- dt probe target is degenerate"), so the
+    #     timestep axis is never exercised;
+    #   * params.json carrying save_t is what flips a run from "legacy" to
+    #     "has_save_t" in hfm/data.py -- legacy runs get stride augmentation and
+    #     an inferred dt and are never excluded by save_t_max, alternating runs
+    #     train at stride 1 on their recorded dt and ARE excluded.  Mixing the two
+    #     means the same nominal dt means different things in each corpus.
+    # Drawn per CONTEXT, not per run, so params.json stays identical down a grid
+    # column and the column still groups into one multi-IC system.
+    save_t_spec: dict[str, Any] = field(default_factory=dict)
+    save_t: float = 0.01              # fixed fallback when save_t_spec is empty
+    # Frames per run, the way gen_alternating sizes a segment: end_t is set to
+    # steps_per_run * save_t so every run lands exactly steps_per_run + 1 saved
+    # frames regardless of its interval.  Without it a run stops at the n_iter cap
+    # and its length depends on the adaptive step, i.e. on the physics draw.
+    steps_per_run: Optional[int] = None
+    n_iter: int = 10000               # max solver iterations (safety cap)
+    end_t: Optional[float] = None        # max sim time (ignored when steps_per_run is set)
     print_i: int = 500
     compile: bool = True              # torch.compile the step (fast on GPU)
 
@@ -230,6 +251,18 @@ def _init_conds(cfg, mesh, edge_tag, bound_edgs, phy):
     if cfg.problem_setup == "nozzle":
         return _S["init_conds_nozzle"](mesh, edge_tag, bound_edgs, phy, cfg)
     raise ValueError(f"Unknown problem_setup '{cfg.problem_setup}'")
+
+
+def _draw_save_t(gen: "GenConfig", rng: np.random.Generator) -> float:
+    """This run's frame interval: sampled from save_t_spec, else the fixed save_t.
+
+    Kept as one helper so grid and legacy modes cannot end up drawing it
+    differently, and so "no spec" keeps the old single-interval behaviour rather
+    than silently changing existing configs.
+    """
+    if not gen.save_t_spec:
+        return float(gen.save_t)
+    return float(_sample_one("save_t", gen.save_t_spec, rng))
 
 
 def _sample_specs(specs: dict[str, dict], rng: np.random.Generator) -> dict[str, Any]:
@@ -358,16 +391,23 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
             # so the same n_ic freestream draws are reused across every context —
             # that reuse is what makes a starting frame recur under many contexts.
             contexts = [_sample_specs(gen.context_param_specs, rng) for _ in range(gen.n_context)]
+            # One interval per CONTEXT: the column shares it, so params.json stays
+            # identical down the column and grouping still sees one system.  The
+            # frame rate is part of what defines the prediction task, so it
+            # belongs with the physics rather than with the IC.
+            ctx_dts = [_draw_save_t(gen, rng) for _ in range(gen.n_context)]
             ics = [_sample_specs(gen.ic_param_specs, rng) for _ in range(gen.n_ic)]
-            run_plan = [(f"c{j:03d}_i{i:03d}", ctx, ic, j, i)
+            run_plan = [(f"c{j:03d}_i{i:03d}", ctx, ic, j, i, ctx_dts[j])
                         for j, ctx in enumerate(contexts)
                         for i, ic in enumerate(ics)]
         else:
-            run_plan = [(f"{r:04d}", _sample_run(gen, rng), {}, None, None)
+            run_plan = [(f"{r:04d}", _sample_run(gen, rng), {}, None, None,
+                         _draw_save_t(gen, rng))
                         for r in range(gen.runs_per_mesh)]
 
         n_runs_mesh = len(run_plan)
-        for idx, (label, context_params, ic_params, cid, iid) in enumerate(run_plan):
+        for idx, (label, context_params, ic_params, cid, iid,
+                  save_t) in enumerate(run_plan):
             run_uid = secrets.token_hex(4)
             run_dir = os.path.join(mesh_dir, f"run_{label}_{run_uid}")
             os.makedirs(run_dir, exist_ok=True)
@@ -379,8 +419,8 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
             # they do not split the grouping.)  C_v lives here, not in ic.json,
             # because the data loader reads it from params.json to convert
             # primitives -> conserved.
-            record = {**context_params, "problem": problem, "mesh_uid": mesh_uid,
-                      "n_colliders": n_colliders}
+            record = {**context_params, "save_t": save_t, "problem": problem,
+                      "mesh_uid": mesh_uid, "n_colliders": n_colliders}
             if cid is not None:
                 record["context_id"] = cid
             with open(os.path.join(run_dir, "params.json"), "w") as f:
@@ -394,12 +434,13 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
             all_params = {**context_params, **ic_params}
             manifest["runs"].append({"mesh": mesh_uid, "problem": problem,
                                      "run": run_uid, "n_colliders": n_colliders,
-                                     "context_id": cid, "ic_id": iid, **all_params})
+                                     "context_id": cid, "ic_id": iid,
+                                     "save_t": save_t, **all_params})
 
             desc = ", ".join(f"{k}={v}" if isinstance(v, str) else f"{k}={v:.3g}"
                              for k, v in all_params.items())
             print(f"  [mesh {m + 1}/{gen.n_meshes} | run {idx + 1}/{n_runs_mesh}] "
-                  f"{label}: {desc}")
+                  f"{label}: save_t={save_t:.3f}, {desc}")
             if dry_run:
                 continue
 
@@ -407,10 +448,14 @@ def run_gen(gen: GenConfig, dry_run: bool = False, out_dir: Optional[str] = None
             # freestream/initial condition; the context params set the physics).
             overrides = {**all_params, **gen.phys_overrides,
                          "plot": False, "exact_interval": True,   # headless, land on save_t
-                         "save_t": gen.save_t, "n_iter": gen.n_iter,
+                         "save_t": save_t, "n_iter": gen.n_iter,
                          "print_i": gen.print_i, "compile": gen.compile,
                          "save_dir": run_dir}                     # fork saves here directly
-            if gen.end_t is not None:
+            # steps_per_run wins: end_t is a multiple of save_t by construction, so
+            # exact_interval lands the last frame exactly on it.
+            if gen.steps_per_run is not None:
+                overrides["end_t"] = gen.steps_per_run * save_t
+            elif gen.end_t is not None:
                 overrides["end_t"] = gen.end_t
             cfg = apply_overrides(base_cfg, overrides)
             phy = _S["FluidConstitution2D"](cfg, dim=2)

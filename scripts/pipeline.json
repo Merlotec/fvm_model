@@ -3,25 +3,82 @@
   "out_root":         "rollout",
   "frames_per_image": 5,
   "refine_steps": 6,
+  "include_context": true,
+  "include_refiner_detail": false,
+  "refine_feedback": true,
+  "include_refiner_mae": false,
   "models": [
     { "tag": "A",
       "dynamics_ckpt": "../hfm/checkpoints/dynamics_a.ckpt",
       "refiner_ckpt":  "../hfm/checkpoints/refiner_a.pt" },
     { "tag": "B",
-      "dynamics_ckpt": "../hfm/checkpoints/dynamics_b4.pt"}
+      "dynamics_ckpt": "../hfm/checkpoints/dynamics_b5.pt",
+      "refiner_ckpt":  "../hfm/checkpoints/refiner_b5_2.pt" }
   ],
   "rollouts": [
     { "run_dir": "../data/fvm_validation/mesh_b66f0d20/run_c000_i001_78fab81c",
+      "description": "dataset (A) trajectory (no context switching)",
       "fields": ["Vx"],
       "stride": 10 },
     { "run_dir": "../data/fvm_validation/mesh_4b2512d8/run_c002_i002_c258b754",
-      "fields": ["Vx"],
+      "description": "dataset (A) trajectory (no context switching)",
+      "fields": ["Vy"],
       "stride": 7 },
     { "run_dir": "../data/fvm_gen_alternating/mesh_83cc1049/run_a000_s02_f326303b",
+      "description": "dataset (B) trajectory (with context switching)",
       "fields": ["rho"],
       "stride": 3 },
     { "run_dir": "../data/fvm_gen_alternating/mesh_6a86ed1f/run_a000_s00_88f7e0f0",
+      "description": "dataset (B) trajectory (with context switching)",
+      "fields": ["rho"],
+      "stride": 3 },
+
+
+    { "run_dir": "../data/fvm_gen_alternating/mesh_83cc1049/run_a000_s00_60738128",
+      "postfix": "rf",
+      "description": "dataset (B) trajectory (with context switching)",
+      "individual_rollouts": true,
+      "fields": ["rho"],
+      "include_mae": false,
+      "include_base_rollout": true,
+      "include_refiner_detail": true,
+      "stride": 3 },
+
+    
+    { "run_dir": "../data/fvm_validation/mesh_4b2512d8/run_c002_i002_c258b754",
+      "postfix": "lr",
+      "description": "long rollout",
+      "include_energy": true,
+      "fields": ["T"],
+      "stride": 20 },
+
+    { "run_dir": "../data/fvm_validation/mesh_b66f0d20/run_c000_i000_2e21fc94",
+      "postfix": "lr",
+      "description": "long rollout",
+      "include_energy": true,
+      "fields": ["T"],
+      "stride": 20 },
+
+    { "run_dir": "../data/fvm_val_nonmonotonic/mesh_b13fde80/run_a001_s00_f777a714",
+      "_comparison_context": "../data/fvm_val_carreau",
+      "postfix": "od",
+      "description": "non monotonic regime",
+      "fields": ["Vx"],
+      "stride": 3 },
+
+    { "run_dir": "../data/fvm_val_nonmonotonic/mesh_b13fde80/run_a001_s01_c10e3604",
+      "_comparison_context": "../data/fvm_val_carreau",
+      "postfix": "od",
+      "description": "non monotonic regime",
+      "fields": ["rho"],
+      "stride": 3 },
+
+    { "run_dir": "../data/fvm_val_nonmonotonic/mesh_b817fca1/run_a000_s00_fba944bf",
+      "_comparison_context": "../data/fvm_val_carreau",
+      "postfix": "od",
+      "description": "non monotonic regime",
       "fields": ["rho"],
       "stride": 3 }
+
   ]
 }

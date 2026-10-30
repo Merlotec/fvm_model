@@ -1,42 +1,96 @@
 {
-  "_comment": "VALIDATION sweep — same parameter distribution as gen.json (identical context_param_specs / ic_param_specs / colliders / solver settings), but a DIFFERENT seed so both the meshes and the sampled systems are unseen. n_meshes=9 gives 9 distinct collider geometries, i.e. 9 self-contained validation datasets (one mesh dir each). n_context/n_ic are smaller than training only to keep the validation set modest — they are sample COUNTS, not the distribution, so 'same distribution' is preserved. Generate with -o so it lands in data/fvm_validation:  python fvm_model/fvm_gen/run_gen.py fvm_model/fvm_gen/val.json -o ../data/fvm_validation",
-
-  "_problem_note": "ELLIPSE ONLY, on purpose: the nozzle mesh generator fails to close its boundary loop (gmsh 'closed loop' error, on Mac AND the cluster), so no nozzle run ever reached the training data — it is 100% ellipse. Matching that means ellipse only; adding nozzle would make validation mismatch the real training distribution and abort on the bad mesh.",
+  "_comment": "Held-out validation grid. Same generator and SAME standardised schema as gen.json -- identical physics/freestream specs, the same save_t_spec drawn per context and written into params.json, and a frame COUNT rather than an iteration cap. That matters most here: a validation corpus at one fixed interval measures a single corner of the dt axis and its scores are not comparable with training, which is the exact failure hfm/data.py's val_fraction note describes. Smaller grid than gen.json on purpose.",
   "problem": "ellipse",
   "n_meshes": 9,
   "n_context": 6,
   "n_ic": 4,
   "seed": 1234,
-
-  "save_t": 0.01,
-  "n_iter": 12000,
+  "_save_t_note": "Drawn once per CONTEXT (so params.json is identical down a grid column and the column still groups into one system) and written into params.json. A single fixed interval would give the dt probe a constant target -- hfm/data.py warns 'constant -- dt probe target is degenerate' -- and, because it is the presence of save_t in params.json that flips a run from 'legacy' to 'has_save_t' in the loader, a corpus without it trains under stride augmentation on an inferred dt instead of stride 1 on a recorded one.",
+  "save_t_spec": {
+    "dist": "loguniform",
+    "low": 0.01,
+    "high": 0.04
+  },
+  "_steps_note": "Frames per run, mirroring gen_alternating's steps_per_segment: end_t = steps_per_run * save_t, so every run yields exactly steps_per_run + 1 frames whatever its interval. The old n_iter cap made run length depend on the adaptive step, i.e. on the physics draw, so viscous runs came out shorter than inviscid ones.",
+  "steps_per_run": 30,
+  "n_iter": 200000,
   "print_i": 500,
   "compile": true,
-
   "output_subdir": "fvm_validation",
-
   "min_colliders": 1,
   "max_colliders": 4,
-
   "context_param_specs": {
-    "visc_model":       {"choices": ["Newtonian", "PowerLaw", "Carreau", "HerschelBulkley"]},
-    "visc_n":           {"dist": "uniform",   "low": 0.3,  "high": 1.8},
-    "visc_min_factor":  {"dist": "uniform",   "low": 0.1,  "high": 0.6},
-    "visc_gamma_scale": {"dist": "loguniform","low": 2.0,  "high": 40.0},
-
-    "viscosity":        {"dist": "loguniform","low": 3e-4, "high": 6e-2},
-    "visc_bulk":        {"dist": "loguniform","low": 1e-3, "high": 3e-1},
-    "thermal_cond":     {"dist": "loguniform","low": 5e-7, "high": 5e-3},
-    "C_v":              {"dist": "uniform",   "low": 1.5,  "high": 3.0},
-    "gamma":            {"dist": "uniform",   "low": 1.1,  "high": 1.67}
+    "visc_model": {
+      "choices": [
+        "Newtonian",
+        "PowerLaw",
+        "Carreau",
+        "HerschelBulkley"
+      ]
+    },
+    "visc_n": {
+      "dist": "uniform",
+      "low": 0.3,
+      "high": 1.8
+    },
+    "visc_min_factor": {
+      "dist": "uniform",
+      "low": 0.1,
+      "high": 0.6
+    },
+    "visc_gamma_scale": {
+      "dist": "loguniform",
+      "low": 2.0,
+      "high": 40.0
+    },
+    "viscosity": {
+      "dist": "loguniform",
+      "low": 0.0003,
+      "high": 0.06
+    },
+    "visc_bulk": {
+      "dist": "loguniform",
+      "low": 0.001,
+      "high": 0.3
+    },
+    "thermal_cond": {
+      "dist": "loguniform",
+      "low": 5e-07,
+      "high": 0.005
+    },
+    "C_v": {
+      "dist": "uniform",
+      "low": 1.5,
+      "high": 3.0
+    },
+    "gamma": {
+      "dist": "uniform",
+      "low": 1.1,
+      "high": 1.67
+    }
   },
-
   "ic_param_specs": {
-    "rho_inf":          {"dist": "uniform",   "low": 0.5,  "high": 2.0},
-    "T_inf":            {"dist": "uniform",   "low": 80.0, "high": 140.0},
-    "v_n_inf":          {"dist": "uniform",   "low": 2.0,  "high": 7.0},
-    "aoa_deg":          {"dist": "uniform",   "low": 0.0,  "high": 360.0}
+    "rho_inf": {
+      "dist": "uniform",
+      "low": 0.5,
+      "high": 2.0
+    },
+    "T_inf": {
+      "dist": "uniform",
+      "low": 80.0,
+      "high": 140.0
+    },
+    "v_n_inf": {
+      "dist": "uniform",
+      "low": 2.0,
+      "high": 7.0
+    },
+    "aoa_deg": {
+      "dist": "uniform",
+      "low": 0.0,
+      "high": 360.0
+    }
   },
-
-  "phys_overrides": {}
+  "phys_overrides": {},
+  "_problem_note": "ELLIPSE ONLY, on purpose: the nozzle mesh generator fails to close its boundary loop (gmsh 'closed loop' error, on Mac AND the cluster), so no nozzle run ever reached the training data \u2014 it is 100% ellipse. Matching that means ellipse only; adding nozzle would make validation mismatch the real training distribution and abort on the bad mesh."
 }

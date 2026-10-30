@@ -1,12 +1,19 @@
 {
-  "_comment": "In-context grid generation. Per mesh we run the full n_context x n_ic grid: n_context hidden-physics draws (each a SYSTEM to infer) x n_ic shared freestream/IC draws. A column (fixed physics, varying IC) is one multi-IC system for the demonstration regime; a row (fixed IC, varying physics) is the SAME starting frame under many contexts, which forces the model to actually use the context instead of memorising frame appearance. context_param_specs -> params.json (the system, and what is inferred); ic_param_specs -> ic.json (shared across contexts). Leave both empty to fall back to legacy per-run param_specs sampling.",
+  "_comment": "In-context grid generation. Per mesh we run the full n_context x n_ic grid: n_context hidden-physics draws (each a SYSTEM to infer) x n_ic shared freestream/IC draws. A column (fixed physics AND fixed save_t, varying IC) is one multi-IC system for the demonstration regime; a row (fixed IC, varying physics) is the SAME starting frame under many contexts, which forces the model to use the context instead of memorising frame appearance. context_param_specs + save_t -> params.json (the system, and what is inferred); ic_param_specs -> ic.json (shared across contexts). STANDARDISED with the other generator in this directory: both draw the SAME hidden-physics and freestream specs, both draw a per-system frame interval from the SAME save_t_spec, both write that interval into params.json, and both size a run by a frame COUNT rather than an iteration cap. That is what makes the two corpora interchangeable for context-switch training -- a run means the same thing to hfm/data.py whichever generator produced it. Keep the specs below in sync when either is edited.",
   "problem": "ellipse",
   "n_meshes": 12,
   "n_context": 12,
   "n_ic": 6,
   "seed": null,
-  "save_t": 0.01,
-  "n_iter": 12000,
+  "_save_t_note": "Drawn once per CONTEXT (so params.json is identical down a grid column and the column still groups into one system) and written into params.json. A single fixed interval would give the dt probe a constant target -- hfm/data.py warns 'constant -- dt probe target is degenerate' -- and, because it is the presence of save_t in params.json that flips a run from 'legacy' to 'has_save_t' in the loader, a corpus without it trains under stride augmentation on an inferred dt instead of stride 1 on a recorded one.",
+  "save_t_spec": {
+    "dist": "loguniform",
+    "low": 0.01,
+    "high": 0.04
+  },
+  "_steps_note": "Frames per run, mirroring gen_alternating's steps_per_segment: end_t = steps_per_run * save_t, so every run yields exactly steps_per_run + 1 frames whatever its interval. The old n_iter cap made run length depend on the adaptive step, i.e. on the physics draw, so viscous runs came out shorter than inviscid ones.",
+  "steps_per_run": 30,
+  "n_iter": 200000,
   "print_i": 500,
   "compile": true,
   "output_subdir": "fvm_gen_incontext",

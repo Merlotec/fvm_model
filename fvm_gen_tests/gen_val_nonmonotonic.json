@@ -1,0 +1,95 @@
+{
+  "_comment": "HELD-OUT CONSTITUTIVE LAW validation set. Identical to fvm_gen/gen_alternating.json except visc_model is pinned to NonMonotonic -- a fifth viscosity model the training corpus never contains -- and two specs are narrowed (see below). NonMonotonic thins toward visc_min_factor near gamma_dot ~ visc_gamma_scale and then JAMS, jumping by a factor of 10-40 over less than a decade of shear rate to a plateau A = 2 + 10*visc_n. All four trained models are MONOTONE in shear rate; none can dip and then rise, and none produces the order-of-magnitude viscosity contrast WITHIN one frame that this does (over the flow's own shear range, gamma_dot 5-200: Carreau spans a factor 2.7, this spans 17). That intra-frame contrast -- nearly inviscid where shear is low, effectively jammed where it is high -- is what makes the fields, not just the formula, out of distribution.",
+  "problem": "ellipse",
+  "n_meshes": 2,
+  "trajs_per_mesh": 2,
+  "n_segments": 2,
+  "seed": null,
+  "steps_per_segment": 30,
+  "save_t_spec": {
+    "dist": "loguniform",
+    "low": 0.01,
+    "high": 0.04
+  },
+  "n_iter": 200000,
+  "print_i": 500,
+  "compile": true,
+  "output_subdir": "fvm_val_nonmonotonic",
+  "min_colliders": 1,
+  "max_colliders": 4,
+  "_context_note": "Same hidden-physics resampling as training, with visc_model FIXED. The other context parameters still alternate per segment, so the data has the same structure the model was trained to read; only the law it must infer is new.",
+  "context_param_specs": {
+    "visc_model": {
+      "choices": [
+        "NonMonotonic"
+      ]
+    },
+    "visc_n": {
+      "_note": "NARROWED to <1. The mirror (gen_mirror.py --set visc_model=Carreau) reuses visc_n, and Carreau with n>1 is shear-THICKENING -- it would reach a high-shear factor of ~15 and stop being the monotone contrast the comparison needs. Below 1 the mirror is canonical shear-thinning Carreau (1.7 -> 0.3) against this law's 1 -> 0.7 -> 5..11. Still inside the training range.",
+      "dist": "uniform",
+      "low": 0.3,
+      "high": 0.9
+    },
+    "visc_min_factor": {
+      "dist": "uniform",
+      "low": 0.1,
+      "high": 0.6
+    },
+    "visc_gamma_scale": {
+      "_note": "NARROWED to the low end of the training range (which is 2-40). The thickening onset is 1.5*visc_gamma_scale, and the measured shear rate in these flows has median ~1-5 / p95 ~20-40, so an onset above ~10 leaves almost none of the fluid thickened and the law never shows up in the fields. At 2.5-5 about 28% of the domain jams.",
+      "dist": "loguniform",
+      "low": 2.5,
+      "high": 5.0
+    },
+    "viscosity": {
+      "_note": "NARROWED to the lower part of the training range. Peak effective viscosity is mu*A with A up to ~46, and the jammed regions set the viscous stability limit; capping mu at 0.002 keeps mu*A <= 0.09, comparable to the stiffest training runs (0.06 * 1.7). The mirror, whose factor is <=1.7, stays well inside distribution.",
+      "dist": "loguniform",
+      "low": 0.0003,
+      "high": 0.002
+    },
+    "visc_bulk": {
+      "dist": "loguniform",
+      "low": 0.001,
+      "high": 0.3
+    },
+    "thermal_cond": {
+      "dist": "loguniform",
+      "low": 5e-07,
+      "high": 0.005
+    },
+    "C_v": {
+      "dist": "uniform",
+      "low": 1.5,
+      "high": 3.0
+    },
+    "gamma": {
+      "dist": "uniform",
+      "low": 1.1,
+      "high": 1.67
+    }
+  },
+  "_ic_note": "Freestream/BC, sampled once per trajectory and held fixed across its segments. Copied verbatim from the training config.",
+  "ic_param_specs": {
+    "rho_inf": {
+      "dist": "uniform",
+      "low": 0.5,
+      "high": 2.0
+    },
+    "T_inf": {
+      "dist": "uniform",
+      "low": 80.0,
+      "high": 140.0
+    },
+    "v_n_inf": {
+      "dist": "uniform",
+      "low": 2.0,
+      "high": 7.0
+    },
+    "aoa_deg": {
+      "dist": "uniform",
+      "low": 0.0,
+      "high": 360.0
+    }
+  },
+  "phys_overrides": {}
+}

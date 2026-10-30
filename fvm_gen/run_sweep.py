@@ -18,7 +18,7 @@ import sys
 import pickle
 import secrets
 from copy import deepcopy
-from typing import Union, Any
+from typing import Union, Any, Optional
 
 import numpy as np
 import torch
@@ -104,6 +104,13 @@ def run_sweep(sweep_cfg: Optional[SweepConfig] = None):
     torch.manual_seed(42)
 
     base_cfg = _make_cfg(sweep_cfg.problem)
+
+    # phys_overrides are "applied to every run", and some of them (n_colliders,
+    # min_A/max_A/lnscale) define the GEOMETRY -- so they have to land before
+    # generate_mesh() below, not only on the per-run cfg.  They are re-applied
+    # per run further down, which is harmless.
+    if sweep_cfg.phys_overrides:
+        base_cfg = apply_overrides(base_cfg, sweep_cfg.phys_overrides)
 
     device = os.environ.get("FVM_DEVICE")
     if device is not None:
