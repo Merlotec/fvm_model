@@ -403,6 +403,13 @@ def cmd_generate(args) -> None:
     if not args.dry_run:
         RG._import_solver()
     import torch                                            # noqa: E402
+    # ConfigEllipse.device defaults to "cpu", so without this a GPU node would
+    # silently solve on the CPU.  FVM_DEVICE is the same switch run_gen.py
+    # documents.  It is deliberately NOT part of the plan: it is hardware, not
+    # experiment design, and shards may legitimately run on different nodes --
+    # but CPU and GPU float reductions differ, so it is recorded per run and
+    # verify refuses a pair whose arms were produced on different devices.
+    device = os.environ.get('FVM_DEVICE', 'cpu')
 
     n_ok = n_skip = n_fail = 0
     for ti, tr in enumerate(mine):
@@ -453,7 +460,8 @@ def cmd_generate(args) -> None:
             (run_dir / 'ic.json').write_text(json.dumps(
                 {**tr['ic'], 'traj_id': tr['traj'], 'traj_uid': f't{tr["traj"]:05d}',
                  'segment_id': s, 't_offset': round(t_offset, 6),
-                 'duration': round(dur, 6), 'arm': arm}, indent=2))
+                 'duration': round(dur, 6), 'arm': arm,
+                 'device': device}, indent=2))
             t_offset += dur
 
             base = RG.apply_overrides(RG._make_base_cfg(md['problem']),
@@ -462,7 +470,7 @@ def cmd_generate(args) -> None:
                 **ctx, **tr['ic'], 'plot': False, 'exact_interval': True,
                 'save_t': save_t, 'end_t': dur, 'n_iter': plan['n_iter'],
                 'print_i': plan['print_i'], 'compile': plan['compile'],
-                'save_dir': str(run_dir)})
+                'device': device, 'save_dir': str(run_dir)})
             phy = RG._S['FluidConstitution2D'](cfg, dim=2)
             bc_tags, us_default = RG._init_conds(cfg, mesh, etag, be, phy)
             if prims_prev is None:
@@ -644,8 +652,9 @@ def cmd_verify(args) -> None:
                     json.loads((runs[arm][k] / 'ic.json').read_text()))
               for arm in ARMS}
         a, b = js['switching'], js['frozen']
-        ic_same &= {x: y for x, y in a[1].items() if x != 'arm'} == \
-                   {x: y for x, y in b[1].items() if x != 'arm'}
+        skip = ('arm', 'device')
+        ic_same &= {x: y for x, y in a[1].items() if x not in skip} == \
+                   {x: y for x, y in b[1].items() if x not in skip}
         st_same &= a[0]['save_t'] == b[0]['save_t']
     chk(ic_same, 'freestream/IC and lineage identical for every matched run')
     chk(st_same, 'save_t identical for every matched run')
@@ -658,6 +667,14 @@ def cmd_verify(args) -> None:
     chk(sum(use['switching'].values()) == sum(use['frozen'].values()),
         f'same total segments per arm ({sum(use["switching"].values())} vs '
         f'{sum(use["frozen"].values())})')
+    # CPU and GPU differ in float reduction order, so a pair split across
+    # devices carries a systematic numerical difference between the arms that
+    # has nothing to do with the treatment.
+    devs = {arm: {json.loads((d / 'ic.json').read_text()).get('device', 'cpu')
+                  for d in runs[arm].values()} for arm in ARMS}
+    chk(len(devs['switching'] | devs['frozen']) == 1,
+        f'all runs produced on one device (switching {sorted(devs["switching"])}, '
+        f'frozen {sorted(devs["frozen"])})')
 
     # The treatment, and only the treatment.
     per = {arm: {} for arm in ARMS}
