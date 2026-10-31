@@ -55,3 +55,6 @@ out
 # figures + CSVs are regenerated from checkpoints, so they never belong in git.
 rollout
 report
+
+# Local cluster settings (machine-specific; see scripts/isambard_pair.env.example)
+scripts/isambard_pair.env

@@ -40,13 +40,51 @@
 #   FORCE=1       let plan replace an existing plan.json
 #   DRY=1         print the sbatch commands and exit
 #
+# Settings files, so none of this has to be retyped:
+#
+#   ENV_FILE=<path>   source this file first  [scripts/isambard_pair.env if present]
+#
+# Variables already set in the real environment WIN over the file, so a one-off
+# override still works:  OUT=$HOME/data/other ./scripts/submit_isambard_pair.sh
+# That works because the file assigns with `: "${VAR:=value}"` rather than
+# `VAR=value` -- see scripts/isambard_pair.env.example.
+#
+# What belongs where:
+#
+#   machine-specific, DO NOT COMMIT (scripts/isambard_pair.env, gitignored):
+#       OUT, ACCOUNT, PARTITION, SOLVER_DIR, FVM_DEVICE, CPUS, GPUS, T_*
+#   experiment definition, DO COMMIT (e.g. scripts/experiments/pair_A.env):
+#       TRAJ, SEGMENTS, CONTEXTS, MESHES, SAVE_T_SCOPE, SAVE_T, SEED
+#
+# Commit the experiment file: it is what makes the corpus reproducible, and a
+# gitignored .env would lose it.  Set SEED there explicitly -- left unset, plan
+# draws fresh entropy, and the file then no longer describes what was built.
+#
+#   ENV_FILE=scripts/experiments/pair_A.env ./scripts/submit_isambard_pair.sh
+#
+# Note plan.json already records TRAJ/SEGMENTS/CONTEXTS/MESHES/save_t/seed once
+# plan has run, and IT is the authority from then on: the generate and finish
+# stages read the plan and need only OUT.  Changing the experiment variables
+# after planning does not change an existing corpus (and plan refuses to
+# overwrite without FORCE), so the stale values would just mislead.
+#
 # Resuming: re-run this script with the same OUT and FORCE unset.  plan refuses
 # to overwrite, and each generate shard skips trajectories already complete on
 # disk, so a time-limited or failed array can simply be submitted again.
 set -euo pipefail
 
-: "${OUT:?set OUT to the dataset root}"
-: "${TRAJ:?set TRAJ to the number of trajectories per arm}"
+# Sourced before any defaulting, so the file can supply anything below.  It uses
+# `: "${VAR:=...}"` assignments, which leave an already-exported value alone.
+ENV_FILE="${ENV_FILE:-scripts/isambard_pair.env}"
+if [ -f "$ENV_FILE" ]; then
+    echo "settings  : $ENV_FILE"
+    set -a; . "$ENV_FILE"; set +a
+elif [ -n "${ENV_FILE_REQUIRED:-}" ]; then
+    echo "no settings file at $ENV_FILE" >&2; exit 1
+fi
+
+: "${OUT:?set OUT to the dataset root (env, or $ENV_FILE)}"
+: "${TRAJ:?set TRAJ to the trajectories per arm (env, or $ENV_FILE)}"
 CONFIG="${CONFIG:-fvm_gen/gen_alternating.json}"
 NSHARDS="${NSHARDS:-8}"
 FVM_DEVICE="${FVM_DEVICE:-cpu}"
