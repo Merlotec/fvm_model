@@ -386,9 +386,19 @@ def _copy_atomic(src: Path, dst: Path) -> None:
     os.replace(tmp, dst)
 
 
+def _load_plan(out: Path) -> dict:
+    f = out / 'plan.json'
+    if not f.exists():
+        raise SystemExit(f'no plan at {f}\nRun the plan step first — it draws the '
+                         f'contexts, ICs, dt and meshes that both arms share:\n'
+                         f'  gen_pair.py plan --config <gen json> --out {out} '
+                         f'--trajectories N')
+    return json.loads(f.read_text())
+
+
 def cmd_generate(args) -> None:
     out = Path(args.out).resolve()
-    plan = json.loads((out / 'plan.json').read_text())
+    plan = _load_plan(out)
     if plan['version'] != PLAN_VERSION:
         raise SystemExit(f'plan version {plan["version"]} != {PLAN_VERSION}')
     arm = args.arm
@@ -523,7 +533,7 @@ def cmd_generate(args) -> None:
 
 def cmd_reconcile(args) -> None:
     out = Path(args.out).resolve()
-    plan = json.loads((out / 'plan.json').read_text())
+    plan = _load_plan(out)
     S, steps = plan['n_segments'], plan['steps_per_segment']
     trajs = plan['trajectories']
     already = _dropped(out)
@@ -577,7 +587,7 @@ def cmd_reconcile(args) -> None:
 
 def cmd_verify(args) -> None:
     out = Path(args.out).resolve()
-    plan = json.loads((out / 'plan.json').read_text())
+    plan = _load_plan(out)
     S, steps, K = plan['n_segments'], plan['steps_per_segment'], plan['n_contexts']
     T = plan['n_trajectories']
     dropped = _dropped(out)
