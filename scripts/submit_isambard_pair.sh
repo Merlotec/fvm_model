@@ -37,6 +37,8 @@
 #   T_GEN         per-shard walltime           [04:00:00]
 #   T_FIN         finish walltime              [00:30:00]
 #   SOLVER_DIR    fvm_solver checkout          [../fvm_solver]
+#   VENV          python env                   [$SOLVER_DIR/.venv/$(uname -m)]
+#   SKIP_ENV_CHECK=1  submit without checking the venv is built
 #   FORCE=1       let plan replace an existing plan.json
 #   DRY=1         print the sbatch commands and exit
 #
@@ -123,6 +125,7 @@ FVM_DEVICE="${FVM_DEVICE:-cpu}"
 CPUS="${CPUS:-8}"
 if [ "$FVM_DEVICE" = cpu ]; then GPUS="${GPUS:-0}"; else GPUS="${GPUS:-1}"; fi
 SLURM_SCRIPT="scripts/isambard_pair.slurm"
+export SOLVER_DIR="${SOLVER_DIR:-$(cd .. && pwd)/fvm_solver}"
 
 [ -f "$CONFIG" ]       || { echo "no config at $CONFIG (run from the repo root?)" >&2; exit 1; }
 [ -f "$SLURM_SCRIPT" ] || { echo "no $SLURM_SCRIPT (run from the repo root?)" >&2; exit 1; }
@@ -132,6 +135,29 @@ fi
 
 # NB if-blocks, not `[ test ] && arr+=(...)`: that AND-list returns non-zero
 # when the test is false, which under `set -e` kills the script.
+# Pre-flight the venv here, not in 20 queued jobs.  requirements.txt has a
+# git+https dependency (cprint, imported by the solver), compute nodes usually
+# have no outbound internet, and `uv pip install -r` is one transaction -- so a
+# venv built inside a job can end up with torch and no numpy, and every job then
+# dies the same way hours later.
+VENV="${VENV:-$SOLVER_DIR/.venv/$(uname -m)}"
+if [ ! -f "$VENV/.installed" ] && [ -z "${SKIP_ENV_CHECK:-}" ]; then
+    echo "No ready venv at $VENV" >&2
+    echo >&2
+    echo "Build it on this login node first (it needs outbound https):" >&2
+    echo "  OUT=$OUT STAGE=env bash $SLURM_SCRIPT" >&2
+    echo >&2
+    echo "If the generate partition is a DIFFERENT architecture from this login" >&2
+    echo "node (e.g. an x86 MACS partition from an aarch64 login node), build it" >&2
+    echo "in a short interactive job on that partition instead, because the venv" >&2
+    echo "path is per-\$(uname -m):" >&2
+    echo "  srun --partition=<p> --pty env OUT=$OUT STAGE=env bash $SLURM_SCRIPT" >&2
+    echo >&2
+    echo "Then re-run this script. (SKIP_ENV_CHECK=1 submits anyway.)" >&2
+    exit 1
+fi
+echo "venv      : $VENV"
+
 COMMON=(--parsable)   # each job adds its own --export=ALL,STAGE=...
 if [ -n "${ACCOUNT:-}" ];   then COMMON+=(--account="$ACCOUNT"); fi
 if [ -n "${PARTITION:-}" ]; then COMMON+=(--partition="$PARTITION"); fi
@@ -144,7 +170,7 @@ if [ -n "${THROTTLE:-}" ]; then ARRAY="$ARRAY%$THROTTLE"; fi
 export OUT CONFIG TRAJ NSHARDS FVM_DEVICE
 export SEGMENTS="${SEGMENTS:-4}" MESHES="${MESHES:-8}" SAVE_T_SCOPE="${SAVE_T_SCOPE:-fixed}"
 export CONTEXTS="${CONTEXTS:-}" SAVE_T="${SAVE_T:-}" SEED="${SEED:-}" FORCE="${FORCE:-}"
-export SOLVER_DIR="${SOLVER_DIR:-$(cd .. && pwd)/fvm_solver}"
+export VENV
 
 run() {           # run <description> <sbatch args...>
     local what="$1"; shift
